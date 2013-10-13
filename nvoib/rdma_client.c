@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
+#include <mqueue.h>
 
 #include "hw/pci/pci.h"
 #include "hw/pci/msix.h"
@@ -29,7 +30,7 @@ void *client_wait_txring(void *arg){
 
 	/* temporary for debugging... */
 	static int connected = 0;
-	static rdma_cm_id *id_test;
+	static struct rdma_cm_id *id_test;
 	/* here */
 
 	if(mq_getattr(pci_dev->tx_mq, &attr) < 0){
