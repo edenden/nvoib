@@ -5,21 +5,29 @@
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
 #include <sys/epoll.h>
+#include <pthread.h>
 #include <mqueue.h>
+
+#include "hw/pci/pci.h"
+#include "hw/pci/msix.h"
 
 #include "nvoib.h"
 #include "rdma_event.h"
+#include "rdma_cq.h"
+#include "rdma_server.h"
+#include "rdma_client.h"
+#include "rdma_slot.h"
 
 static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
-                                                int ep_fd, mqd_t sl_mq, int flag);
+						int ep_fd, int flag);
 static void rdma_build_connection(struct rdma_cm_id *id);
 static void rdma_set_conn_params(struct rdma_conn_param *params);
 static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr);
-static void rdma_cleanup_context(struct rdma_cm_id *id);
-static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd);
+static void rdma_cleanup_context(struct rdma_cm_id *id, int ep_fd);
+static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd, mqd_t sl_mq);
 
 static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
-						int ep_fd, mqd_t sl_mq, int flag){
+						int ep_fd, int flag){
 
 	struct context *ctx;
 	struct epoll_event ev;
@@ -27,11 +35,13 @@ static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_de
 	id->context = ctx;
 
 	ctx->pci_dev = pci_dev;
-	ctx->offset = 0
-	ctx->recv_count = 0;
-	ctx->ep_fd = ep_fd;
 	ctx->rx_flag = flag;
-	ctx->msg_mutex = PTHREAD_MUTEX_INITIALIZER;
+        ctx->next_slot = 0;
+        ctx->remain_slot = 0;
+        ctx->next_slot_assign = 0;
+
+	pthread_mutex_init(&ctx->msg_mutex, NULL);
+	pthread_mutex_init(&ctx->slot_mutex, NULL);
 
 	ctx->pd = ibv_alloc_pd(id->verbs);
 	if(ctx->pd == NULL){
@@ -53,15 +63,11 @@ static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_de
 		exit(EXIT_FAILURE);
 	}
 
-	ctx->slot_mutex = PTHREAD_MUTEX_INITIALIZER;
-	ctx->next_slot = 0;
-	ctx->next_slot_assign = 0;
-
 	memset(&ev, 0, sizeof(struct epoll_event));
 	ev.events = EPOLLIN;
 	ev.data.ptr = id;
 
-	if(epoll_ctl(ctx->ep_fd, EPOLL_CTL_ADD, ctx->comp_channel->fd, &ev) != 0){
+	if(epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->comp_channel->fd, &ev) != 0){
 		exit(EXIT_FAILURE);
 	}
 
@@ -100,14 +106,14 @@ static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_at
 	qp_attr->cap.max_recv_sge = 1;
 }
 
-static void rdma_cleanup_context(struct rdma_cm_id *id){
+static void rdma_cleanup_context(struct rdma_cm_id *id, int ep_fd){
         struct context *ctx = (struct context *)id->context;
 
         ibv_dereg_mr(ctx->guest_memory_mr);
         ibv_dereg_mr(ctx->msg_mr);
 
-	if(epoll_ctl(ctx->ep_fd, EPOLL_CTL_DEL, ctx->comp_channel->fd, NULL) != 0){
-		err(EXIT_FAILURE, "failed to remove epoll");
+	if(epoll_ctl(ep_fd, EPOLL_CTL_DEL, ctx->comp_channel->fd, NULL) != 0){
+		exit(EXIT_FAILURE);
 	}
 
         free(ctx->msg);
@@ -149,7 +155,7 @@ void rdma_request_next_write(struct rdma_cm_id *id){
         }
 }
 
-static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd){
+static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd, mqd_t sl_mq){
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
 	struct context *ctx = NULL;
@@ -167,7 +173,7 @@ static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci
 				ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 0);
 				rdma_build_connection(event_copy.id);
 				client_set_mr(event_copy.id);
-				rdma_request_next_msg(id);
+				rdma_request_next_msg(event_copy.id);
 
 				if(rdma_resolve_route(event_copy.id, TIMEOUT_IN_MS) != 0){
 					exit(EXIT_FAILURE);
@@ -184,7 +190,7 @@ static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci
                                 ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 1);
                                 rdma_build_connection(event_copy.id);
 				server_set_mr(event_copy.id);
-				rdma_request_next_write(id);
+				rdma_request_next_write(event_copy.id);
 
 				if(rdma_accept(event_copy.id, &cm_params) != 0){
 					exit(EXIT_FAILURE);
@@ -192,12 +198,12 @@ static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci
 				break;
 
 			case RDMA_CM_EVENT_ESTABLISHED:
-				server_conn_estab(event_copy.id);
+				server_conn_estab(event_copy.id, sl_mq);
 				break;
 
 			case RDMA_CM_EVENT_DISCONNECTED:
 				rdma_destroy_qp(event_copy.id);
-				rdma_cleanup_context(event_copy.id);
+				rdma_cleanup_context(event_copy.id, ep_fd);
 				rdma_destroy_id(event_copy.id);
 				break;
 
@@ -209,11 +215,11 @@ static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci
 	}
 }
 
-void *rdma_event_handling(void *arg){
+void *rdma_event_handling(void *args){
 	struct nvoib_dev *pci_dev = (struct nvoib_dev *)args;
         struct rdma_event_channel *ec = NULL;
 	pthread_t rdma_txwait_thread;
-	pthraed_t rdma_slotassign_thread;
+	pthread_t rdma_slotassign_thread;
 	pthread_t rdma_cqpoll_thread;
 	struct thread_args tharg;
 	int ep_fd;
@@ -228,7 +234,7 @@ void *rdma_event_handling(void *arg){
 		exit(EXIT_FAILURE);
 	}
 
-        sl_mq = mq_open("/sl_mq", O_RDWR | O_CREAT);
+        sl_mq = mq_open("/sl_mq", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, NULL);
         if(sl_mq < 0){
                 exit(EXIT_FAILURE);
         }
@@ -253,9 +259,10 @@ void *rdma_event_handling(void *arg){
         }
 
 	/* waiting event on RDMA... */
-        event_loop(ec, pci_dev, ep_fd);
+	rdma_event_loop(ec, pci_dev, ep_fd, sl_mq);
 
         rdma_destroy_event_channel(ec);
+	return NULL;
 }
 
 

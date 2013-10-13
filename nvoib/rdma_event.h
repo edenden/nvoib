@@ -1,9 +1,10 @@
 void rdma_request_next_msg(struct rdma_cm_id *id);
 void rdma_request_next_write(struct rdma_cm_id *id);
-void *rdma_event_handling(void *arg);
+void *rdma_event_handling(void *args);
 
 #define TIMEOUT_IN_MS 500
 #define MAX_EVENTS 16
+#define RING_SIZE 256
 #define RDMA_SLOT 8
 
 enum message_id {
@@ -16,7 +17,7 @@ struct thread_args {
 	mqd_t sl_mq;
 	struct nvoib_dev *pci_dev;
 	struct rdma_event_channel *ec;
-}
+};
 
 struct message {
 	uint32_t id;

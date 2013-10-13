@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
 
+#include "hw/pci/pci.h"
+#include "hw/pci/msix.h"
+
 #include "nvoib.h"
 #include "rdma_event.h"
 #include "rdma_client.h"
@@ -111,7 +114,7 @@ struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec, char *des
 void client_set_mr(struct rdma_cm_id *id){
 	struct context *ctx = (struct context *)id->context;
 
-	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, ctx->pci_dev.guest_memory, ctx->pci_dev.ram_size,
+	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, ctx->pci_dev->guest_memory, ctx->pci_dev->ram_size,
 				IBV_ACCESS_LOCAL_WRITE);
 	if(ctx->guest_memory_mr == NULL){
 		exit(EXIT_FAILURE);
@@ -135,15 +138,15 @@ static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, ui
 	uint64_t peer_addr;
 	uint32_t peer_rkey;
 
-	pthread_mutex_lock(ctx->slot_mutex);
+	pthread_mutex_lock(&ctx->slot_mutex);
 	if(ctx->remain_slot == 0){
 		printf("no RDMA slot is remaining...\n");
-		pthread_mutex_unlock(ctx->slot_mutex);
+		pthread_mutex_unlock(&ctx->slot_mutex);
 		return;
 	}else{
 		if(ctx->peer_addr == 0 || ctx->peer_rkey == 0){
 			printf("peer_addr or peer_rkey have not arrived\n");
-			pthread_mutex_unlock(ctx->slot_mutex);
+			pthread_mutex_unlock(&ctx->slot_mutex);
 			return;
 		}
 
@@ -153,7 +156,7 @@ static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, ui
 		ctx->next_slot = (ctx->next_slot + 1) % RDMA_SLOT;
 		ctx->remain_slot--;
 	}
-	pthread_mutex_unlock(ctx->slot_mutex);
+	pthread_mutex_unlock(&ctx->slot_mutex);
 
 	memset(&wr, 0, sizeof(wr));
 	wr.wr_id = (uintptr_t)id;

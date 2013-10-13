@@ -8,11 +8,15 @@
 #include <pthread.h>
 #include <mqueue.h>
 
+#include "hw/pci/pci.h"
+#include "hw/pci/msix.h"
+
 #include "nvoib.h"
 #include "rdma_event.h"
 #include "rdma_cq.h"
+#include "rdma_client.h"
 
-static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc);
+static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc, mqd_t sl_mq);
 static void cq_client_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc);
 
 void *cq_wait_poll(void *arg){
@@ -22,6 +26,7 @@ void *cq_wait_poll(void *arg){
 	struct context *ctx;
 	struct thread_args *tharg = (struct thread_args *)arg;
 	int ep_fd = tharg->ep_fd;
+	mqd_t sl_mq = tharg->sl_mq;
 	int i, fd_num;
 	struct epoll_event ev_ret[MAX_EVENTS];
 
@@ -35,7 +40,7 @@ void *cq_wait_poll(void *arg){
 			id = ev_ret[i].data.ptr;
 			ctx = (struct context *)id->context;
 
-			if(ibv_get_cq_event(ctx->comp_channel, &cq, &ctx) != 0){
+			if(ibv_get_cq_event(ctx->comp_channel, &cq, (void **)&ctx) != 0){
 				exit(EXIT_FAILURE);
 			}
 
@@ -48,7 +53,7 @@ void *cq_wait_poll(void *arg){
 			while(ibv_poll_cq(cq, 1, &wc)){
 				if (wc.status == IBV_WC_SUCCESS){
 					if(ctx->rx_flag){
-						cq_server_work_completed(id, &wc);
+						cq_server_work_completed(id, &wc, sl_mq);
 					}else{
 						cq_client_work_completed(id, &wc);
 					}
@@ -63,7 +68,7 @@ void *cq_wait_poll(void *arg){
 	return NULL;
 }
 
-static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
+static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc, mqd_t sl_mq){
 	struct context *ctx = (struct context *)id->context;
 	static uint32_t next_prepare = 0;
 	struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
@@ -94,15 +99,15 @@ static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 			/* TODO: should wait for guest processing RX queue? */
 		}
 
-		if(remain_slot == (RDMA_SLOT / 2)){
+		if(ctx->remain_slot == (RDMA_SLOT / 2)){
 			ctx->msg->id = MSG_ASSIGN;
 			ctx->slot_assign_num = RDMA_SLOT / 2;
-			if(mq_send(sl_mq, &id, sizeof(struct rdma_cm_id *), 10) != 0){
+			if(mq_send(sl_mq, (const char *)&id, sizeof(struct rdma_cm_id *), 10) != 0){
 				exit(EXIT_FAILURE);
 			}
 		}
 	}else if(wc->opcode == IBV_WC_SEND){
-		pthread_mutex_unlock(ctx->msg_mutex);
+		pthread_mutex_unlock(&ctx->msg_mutex);
 	}
 }
 
@@ -113,32 +118,32 @@ static void cq_client_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 	if (wc->opcode & IBV_WC_RECV) {
 		int i;
 
-		pthread_mutex_lock(ctx->slot_mutex);
+		pthread_mutex_lock(&ctx->slot_mutex);
 		if(ctx->msg->id == MSG_MR) {
 			ctx->peer_addr = ctx->msg->addr;
 			ctx->peer_rkey = ctx->msg->rkey;
 			printf("received MR from Server\n");
 
 			for(i = 0; i < ctx->msg->slot_num; i++){
-				ctx->slot[ctx->slot_next_assign + i].data_ptr = ctx->msg->data_ptr[i];
+				ctx->slot[ctx->next_slot_assign + i].data_ptr = ctx->msg->data_ptr[i];
 			}
 
 			ctx->remain_slot += ctx->msg->slot_num;
-			ctx->slot_next_assign = (ctx->slot_next_assign + ctx->msg->slot_num) % RDMA_SLOT;
+			ctx->next_slot_assign = (ctx->next_slot_assign + ctx->msg->slot_num) % RDMA_SLOT;
 			printf("received new %d slot from Server\n", ctx->msg->slot_num);
 		} else if(ctx->msg->id == MSG_ASSIGN) {
                         for(i = 0; i < ctx->msg->slot_num; i++){
-                                ctx->slot[ctx->slot_next_assign + i].data_ptr = ctx->msg->data_ptr[i];
+                                ctx->slot[ctx->next_slot_assign + i].data_ptr = ctx->msg->data_ptr[i];
                         }
 
 			ctx->remain_slot += ctx->msg->slot_num;
-                        ctx->slot_next_assign = (ctx->slot_next_assign + ctx->msg->slot_num) % RDMA_SLOT;
+                        ctx->next_slot_assign = (ctx->next_slot_assign + ctx->msg->slot_num) % RDMA_SLOT;
 			printf("received new %d slot from Server\n", ctx->msg->slot_num);
 		}
-		pthread_mutex_unlock(ctx->slot_mutex);
+		pthread_mutex_unlock(&ctx->slot_mutex);
 
 		rdma_request_next_msg(id);
-	}else if(wc->opcode & IBV_WC_SEND_RDMA_WITH_IMM){
+	}else if(wc->opcode & IBV_WR_RDMA_WRITE_WITH_IMM){
 		struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
 		struct write_remote_info *info = (struct write_remote_info *)wc->wr_id;
 

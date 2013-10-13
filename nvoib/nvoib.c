@@ -1,3 +1,9 @@
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <rdma/rdma_cma.h>
+#include <pthread.h>
+#include <mqueue.h>
+
 #include "hw/hw.h"
 #include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
@@ -6,24 +12,18 @@
 #include "migration/migration.h"
 #include "qapi/qmp/qerror.h"
 
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <rdma/rdma_cma.h>
-#include <pthread.h>
-#include <mqueue.h>
-
 #include "nvoib.h"
 #include "rdma_event.h"
 
 static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned size){
-	//struct nvoib_dev *s = opaque;
+	struct nvoib_dev *pci_dev = opaque;
 	addr &= 0xff;
 
 	switch (addr){
 		case Doorbell:
 			/* check that dest VM ID is reasonable */
-			if (val & 0xffff == 0) {
-				if(mq_send(s->tx_mq, &val, sizeof(uint32_t), 10) != 0){
+			if ((val & 0xffff) == 0) {
+				if(mq_send(pci_dev->tx_mq, (const char *)&val, sizeof(uint32_t), 10) != 0){
 					printf("failed to send message queue\n");
 				}
 			}
@@ -112,7 +112,6 @@ static inline bool is_power_of_two(uint64_t x) {
 }
 
 static uint64_t nvoib_get_size(char *sizestr) {
-
 	uint64_t value;
 	char *ptr;
 
@@ -125,7 +124,7 @@ static uint64_t nvoib_get_size(char *sizestr) {
 			value <<= 30;
 			break;
 		default:
-			fprintf(stderr, "qemu: invalid ram size: %s\n", s->sizearg);
+			fprintf(stderr, "qemu: invalid ram size: %s\n", sizestr);
 			exit(1);
 	}
 
@@ -207,7 +206,7 @@ static int pci_nvoib_init(PCIDevice *dev){
 		s->nvoib_size = nvoib_get_size(s->sizearg);
 	}
 
-	if(s->sysmemsizearg == NULL){
+	if(s->ramsizearg == NULL){
 		fprintf(stderr, "Must specify size of guest memory using '-ramsize' option\n");
 		exit(1);
 	}else{
@@ -277,7 +276,7 @@ static int pci_nvoib_init(PCIDevice *dev){
 
 	printf("guest physical 0x000000 is host virtual %p\n", s->guest_memory);
 
-	s->tx_mq = mq_open("/tx_mq", O_RDWR | O_CREAT);
+	s->tx_mq = mq_open("/tx_mq", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, NULL);
 	if(s->tx_mq < 0){
 		fprintf(stderr, "nvoib: could not open message queue\n");
                 exit(-1);

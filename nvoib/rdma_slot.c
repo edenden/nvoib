@@ -9,6 +9,9 @@
 #include <rdma/rdma_cma.h>
 #include <mqueue.h>
 
+#include "hw/pci/pci.h"
+#include "hw/pci/msix.h"
+
 #include "nvoib.h"
 #include "rdma_event.h"
 #include "rdma_slot.h"
@@ -35,7 +38,7 @@ void *slot_wait_assigning(void *arg){
 	while(read_len = mq_receive(sl_mq, buf, attr.mq_msgsize, NULL)){
 		struct rdma_cm_id *id = *(struct rdma_cm_id *)buf;
 		struct context *ctx = (struct context *)id->context;
-		pthread_mutex_lock(ctx->msg_mutex);
+		pthread_mutex_lock(&ctx->msg_mutex);
 		slot_assign_for_peer(id, ctx->slot_assign_num);
 	} 
 
