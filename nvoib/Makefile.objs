@@ -1,0 +1,4 @@
+ifeq ($(CONFIG_PCI), y)
+obj-$(CONFIG_KVM) += main.o
+endif
+
