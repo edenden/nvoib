@@ -1,4 +1,21 @@
-void *rdma_cq_handling(void *arg){
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <rdma/rdma_cma.h>
+#include <sys/epoll.h>
+#include <pthread.h>
+#include <mqueue.h>
+
+#include "nvoib.h"
+#include "rdma_event.h"
+#include "rdma_cq.h"
+
+static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc);
+static void cq_client_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc);
+
+void *cq_wait_poll(void *arg){
 	struct ibv_cq *cq;
 	struct ibv_wc wc;
 	struct rdma_cm_id *id;
@@ -31,9 +48,9 @@ void *rdma_cq_handling(void *arg){
 			while(ibv_poll_cq(cq, 1, &wc)){
 				if (wc.status == IBV_WC_SUCCESS){
 					if(ctx->rx_flag){
-						rxcon_work_completed(id, &wc);
+						cq_server_work_completed(id, &wc);
 					}else{
-						txcon_work_completed(id, &wc);
+						cq_client_work_completed(id, &wc);
 					}
 				}else{
 					printf("poll_cq: status is not IBV_WC_SUCCESS\n");
@@ -46,7 +63,7 @@ void *rdma_cq_handling(void *arg){
 	return NULL;
 }
 
-static void rxcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
+static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 	struct context *ctx = (struct context *)id->context;
 	static uint32_t next_prepare = 0;
 	struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
@@ -57,7 +74,7 @@ static void rxcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 		ctx->next_slot = (slot_index + 1) % RDMA_SLOT;
 		ctx->remain_slot--;
 
-		rdma_request_write_with_imm(id);
+		rdma_request_next_write(id);
 
 		/* add skb to rx ring buffer */
 		if(!sr->rx.buf[next_prepare].flag){
@@ -89,7 +106,7 @@ static void rxcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 	}
 }
 
-static void txcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
+static void cq_client_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 	struct context *ctx = (struct context *)id->context;
 	static uint32_t next_prepare = 0;
 
@@ -120,7 +137,7 @@ static void txcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 		}
 		pthread_mutex_unlock(ctx->slot_mutex);
 
-		rdma_request_msg(id);
+		rdma_request_next_msg(id);
 	}else if(wc->opcode & IBV_WC_SEND_RDMA_WITH_IMM){
 		struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
 		struct write_remote_info *info = (struct write_remote_info *)wc->wr_id;
@@ -141,40 +158,5 @@ static void txcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 
 		free(info);
 	}
-}
-
-static void rdma_request_msg(struct rdma_cm_id *id){
-        struct context *ctx = (struct context *)id->context;
-
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-        struct ibv_sge sge;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-
-        sge.addr = (uintptr_t)ctx->msg;
-        sge.length = sizeof(*ctx->msg);
-        sge.lkey = ctx->msg_mr->lkey;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
-}
-
-static void rdma_request_write_with_imm(struct rdma_cm_id *id){
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = NULL;
-        wr.num_sge = 0;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
 }
 

@@ -7,10 +7,14 @@
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
 
-#include "rdma.h"
-#include "send.h"
+#include "nvoib.h"
+#include "rdma_event.h"
+#include "rdma_client.h"
 
-int client_wait_txring(void *arg){
+static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, uint32_t size,
+                                struct write_remote_info *info);
+
+void *client_wait_txring(void *arg){
 	struct thread_args *tharg = (struct thread_args *)arg;
 	struct nvoib_dev *pci_dev = tharg->pci_dev;
 	struct rdma_event_channel *ec = tharg->ec;
@@ -104,7 +108,7 @@ struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec, char *des
 	return id;
 }
 
-static void client_set_mr(struct rdma_cm_id *id){
+void client_set_mr(struct rdma_cm_id *id){
 	struct context *ctx = (struct context *)id->context;
 
 	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, ctx->pci_dev.guest_memory, ctx->pci_dev.ram_size,
@@ -122,7 +126,7 @@ static void client_set_mr(struct rdma_cm_id *id){
 }
 
 static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, uint32_t size,
-	struct write_remote_info *info){
+				struct write_remote_info *info){
 
 	struct context *ctx = (struct context *)id->context;
 	struct ibv_send_wr wr, *bad_wr = NULL;

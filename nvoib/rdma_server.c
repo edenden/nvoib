@@ -9,8 +9,9 @@
 #include <rdma/rdma_cma.h>
 #include <mqueue.h>
 
-#include "rdma.h"
-#include "recv.h"
+#include "nvoib.h"
+#include "rdma_event.h"
+#include "rdma_server.h"
 
 void server_start_listen(struct rdma_event_channel *ec, char *recv_port){
         struct sockaddr_in addr;
@@ -36,7 +37,7 @@ void server_start_listen(struct rdma_event_channel *ec, char *recv_port){
 	return;
 }
 
-static void server_set_mr(struct rdma_cm_id *id){
+void server_set_mr(struct rdma_cm_id *id){
 	struct context *ctx = (struct context *)id->context;
 
 	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, ctx->pci_dev.guest_memory, ctx->pci_dev.ram_size,
@@ -53,7 +54,7 @@ static void server_set_mr(struct rdma_cm_id *id){
 	}
 }
 
-static void server_conn_estab(struct rdma_cm_id *id){
+void server_conn_estab(struct rdma_cm_id *id){
 	struct context *ctx = (struct context *)id->context;
 
 	ctx->msg->id = MSG_MR;

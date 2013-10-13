@@ -1,9 +1,6 @@
-void rc_init(pre_conn_cb_fn, connect_cb_fn, completion_cb_fn, disconnect_cb_fn);
-void rc_client_loop(const char *host, const char *port, void *context);
-void rc_disconnect();
-void rc_die(const char *message);
-struct ibv_pd * rc_get_pd();
-void rc_server_loop(const char *port);
+void rdma_request_next_msg(struct rdma_cm_id *id);
+void rdma_request_next_write(struct rdma_cm_id *id);
+void *rdma_event_handling(void *arg);
 
 #define TIMEOUT_IN_MS 500
 #define MAX_EVENTS 16

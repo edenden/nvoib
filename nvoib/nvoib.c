@@ -8,10 +8,12 @@
 
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <rdma/rdma_cma.h>
 #include <pthread.h>
 #include <mqueue.h>
 
-#include "main.h"
+#include "nvoib.h"
+#include "rdma_event.h"
 
 static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned size){
 	//struct nvoib_dev *s = opaque;

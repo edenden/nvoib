@@ -9,8 +9,12 @@
 #include <rdma/rdma_cma.h>
 #include <mqueue.h>
 
-#include "rdma.h"
-#include "recv.h"
+#include "nvoib.h"
+#include "rdma_event.h"
+#include "rdma_slot.h"
+
+static void slot_assign_for_peer(struct rdma_cm_id *id, int slot);
+static void slot_send(struct rdma_cm_id *id);
 
 void *slot_wait_assigning(void *arg){
 	struct thread_args *tharg = (struct thread_args *)arg;
@@ -37,7 +41,7 @@ void *slot_wait_assigning(void *arg){
 
 }
 
-void slot_assign_for_peer(struct rdma_cm_id *id, int slot){
+static void slot_assign_for_peer(struct rdma_cm_id *id, int slot){
 	struct context *ctx = (struct context *)id->context;
 	struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
 	static uint32_t next_consume = 0;

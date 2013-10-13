@@ -7,16 +7,19 @@
 #include <sys/epoll.h>
 #include <mqueue.h>
 
-#include "main.h"
-#include "rdma.h"
+#include "nvoib.h"
+#include "rdma_event.h"
 
-static void rdma_build_context(struct ibv_context *verbs);
-static void rdma_set_qp_attr(struct ibv_qp_init_attr *qp_attr);
-static void event_loop(struct rdma_event_channel *ec, int exit_on_disconnect);
-static void * poll_cq(void *);
+static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
+                                                int ep_fd, mqd_t sl_mq, int flag);
+static void rdma_build_connection(struct rdma_cm_id *id);
+static void rdma_set_conn_params(struct rdma_conn_param *params);
+static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr);
+static void rdma_cleanup_context(struct rdma_cm_id *id);
+static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd);
 
-struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
-	int ep_fd, mqd_t sl_mq, int flag){
+static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
+						int ep_fd, mqd_t sl_mq, int flag){
 
 	struct context *ctx;
 	struct epoll_event ev;
@@ -65,7 +68,7 @@ struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_
 	return ctx;
 }
 
-void rdma_build_connection(struct rdma_cm_id *id){
+static void rdma_build_connection(struct rdma_cm_id *id){
 	struct ibv_qp_init_attr qp_attr;
 	struct context *ctx = (struct context *)id->context;
 
@@ -77,16 +80,14 @@ void rdma_build_connection(struct rdma_cm_id *id){
 	return;
 }
 
-void rdma_set_conn_params(struct rdma_conn_param *params)
-{
+static void rdma_set_conn_params(struct rdma_conn_param *params){
 	memset(params, 0, sizeof(*params));
 
 	params->initiator_depth = params->responder_resources = 1;
 	params->rnr_retry_count = 7; /* infinite retry */
 }
 
-void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr)
-{
+static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr){
 	memset(qp_attr, 0, sizeof(*qp_attr));
 
 	qp_attr->send_cq = ctx->cq;
@@ -113,7 +114,42 @@ static void rdma_cleanup_context(struct rdma_cm_id *id){
         free(ctx);
 }
 
-void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd){
+void rdma_request_next_msg(struct rdma_cm_id *id){
+        struct context *ctx = (struct context *)id->context;
+
+        struct ibv_recv_wr wr, *bad_wr = NULL;
+        struct ibv_sge sge;
+
+        memset(&wr, 0, sizeof(wr));
+
+        wr.wr_id = (uintptr_t)id;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        sge.addr = (uintptr_t)ctx->msg;
+        sge.length = sizeof(*ctx->msg);
+        sge.lkey = ctx->msg_mr->lkey;
+
+        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
+                exit(EXIT_FAILURE);
+        }
+}
+
+void rdma_request_next_write(struct rdma_cm_id *id){
+        struct ibv_recv_wr wr, *bad_wr = NULL;
+
+        memset(&wr, 0, sizeof(wr));
+
+        wr.wr_id = (uintptr_t)id;
+        wr.sg_list = NULL;
+        wr.num_sge = 0;
+
+        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
+                exit(EXIT_FAILURE);
+        }
+}
+
+static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd){
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
 	struct context *ctx = NULL;
@@ -131,7 +167,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, i
 				ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 0);
 				rdma_build_connection(event_copy.id);
 				client_set_mr(event_copy.id);
-				rdma_request_msg(id);
+				rdma_request_next_msg(id);
 
 				if(rdma_resolve_route(event_copy.id, TIMEOUT_IN_MS) != 0){
 					exit(EXIT_FAILURE);
@@ -148,7 +184,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, i
                                 ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 1);
                                 rdma_build_connection(event_copy.id);
 				server_set_mr(event_copy.id);
-				rdma_request_write_with_imm(id);
+				rdma_request_next_write(id);
 
 				if(rdma_accept(event_copy.id, &cm_params) != 0){
 					exit(EXIT_FAILURE);
@@ -208,7 +244,7 @@ void *rdma_event_handling(void *arg){
 		exit(EXIT_FAILURE);
 	}
 
-	if(pthread_create(&rdma_cqpoll_thread, NULL, rdma_cq_handling, &tharg) != 0){
+	if(pthread_create(&rdma_cqpoll_thread, NULL, cq_wait_poll, &tharg) != 0){
                 exit(EXIT_FAILURE);
         }
 
