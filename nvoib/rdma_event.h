@@ -17,7 +17,7 @@ enum message_id {
 struct thread_args {
 	int ep_fd;
 	mqd_t sl_mq;
-	struct rdmanic *pci_dev;
+	struct nvoib_dev *pci_dev;
 	struct rdma_event_channel *ec;
 }
 
@@ -38,7 +38,7 @@ struct context {
         struct ibv_pd *pd;
         struct ibv_cq *cq;
         struct ibv_comp_channel *comp_channel;
-        struct rdmanic *pci_dev;
+        struct nvoib_dev *pci_dev;
 	int ep_fd;
 
 	pthread_mutex_t msg_mutex;

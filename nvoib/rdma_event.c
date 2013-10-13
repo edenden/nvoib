@@ -15,7 +15,7 @@ static void rdma_set_qp_attr(struct ibv_qp_init_attr *qp_attr);
 static void event_loop(struct rdma_event_channel *ec, int exit_on_disconnect);
 static void * poll_cq(void *);
 
-struct context *rdma_rdma_build_context(struct rdma_cm_id *id, struct rdmanic *pci_dev,
+struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
 	int ep_fd, mqd_t sl_mq, int flag){
 
 	struct context *ctx;
@@ -99,41 +99,6 @@ void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr)
 	qp_attr->cap.max_recv_sge = 1;
 }
 
-static void rdma_request_msg(struct rdma_cm_id *id){
-        struct context *ctx = (struct context *)id->context;
-
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-        struct ibv_sge sge;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-
-        sge.addr = (uintptr_t)ctx->msg;
-        sge.length = sizeof(*ctx->msg);
-        sge.lkey = ctx->msg_mr->lkey;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
-}
-
-static void rdma_request_write_with_imm(struct rdma_cm_id *id){
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = NULL;
-        wr.num_sge = 0;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
-}
-
 static void rdma_cleanup_context(struct rdma_cm_id *id){
         struct context *ctx = (struct context *)id->context;
 
@@ -148,7 +113,7 @@ static void rdma_cleanup_context(struct rdma_cm_id *id){
         free(ctx);
 }
 
-void rdma_event_loop(struct rdma_event_channel *ec, struct rdmanic *pci_dev, int ep_fd){
+void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd){
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
 	struct context *ctx = NULL;
@@ -165,7 +130,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct rdmanic *pci_dev, int
 			case RDMA_CM_EVENT_ADDR_RESOLVED:
 				ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 0);
 				rdma_build_connection(event_copy.id);
-				tx_set_memory_region(event_copy.id);
+				client_set_mr(event_copy.id);
 				rdma_request_msg(id);
 
 				if(rdma_resolve_route(event_copy.id, TIMEOUT_IN_MS) != 0){
@@ -182,7 +147,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct rdmanic *pci_dev, int
 			case RDMA_CM_EVENT_CONNECT_REQUEST:
                                 ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 1);
                                 rdma_build_connection(event_copy.id);
-				rx_set_memory_region(event_copy.id);
+				server_set_mr(event_copy.id);
 				rdma_request_write_with_imm(id);
 
 				if(rdma_accept(event_copy.id, &cm_params) != 0){
@@ -191,7 +156,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct rdmanic *pci_dev, int
 				break;
 
 			case RDMA_CM_EVENT_ESTABLISHED:
-				rx_on_connection(event_copy.id);
+				server_conn_estab(event_copy.id);
 				break;
 
 			case RDMA_CM_EVENT_DISCONNECTED:
@@ -209,11 +174,11 @@ void rdma_event_loop(struct rdma_event_channel *ec, struct rdmanic *pci_dev, int
 }
 
 void *rdma_event_handling(void *arg){
-	struct rdmanic *pci_dev = (struct rdmanic *)args;
+	struct nvoib_dev *pci_dev = (struct nvoib_dev *)args;
         struct rdma_event_channel *ec = NULL;
-	pthread_t tx_wait_thread;
-	pthraed_t rx_assign_thread;
-	pthread_t cq_poller_thread;
+	pthread_t rdma_txwait_thread;
+	pthraed_t rdma_slotassign_thread;
+	pthread_t rdma_cqpoll_thread;
 	struct thread_args tharg;
 	int ep_fd;
 	mqd_t sl_mq;
@@ -232,22 +197,22 @@ void *rdma_event_handling(void *arg){
                 exit(EXIT_FAILURE);
         }
 
-	rx_start_listen(ec, "12345");
+	server_start_listen(ec, "12345");
 
 	tharg.ep_fd = ep_fd;
 	tharg.sl_mq = sl_mq;
 	tharg.pci_dev = pci_dev;
 	tharg.ec = ec;
 
-	if(pthread_create(&rx_assign_thread, NULL, rx_wait_assign, &tharg) != 0){
+	if(pthread_create(&rdma_slotassign_thread, NULL, slot_wait_assigning, &tharg) != 0){
 		exit(EXIT_FAILURE);
 	}
 
-	if(pthread_create(&cq_poller_thread, NULL, rdma_cq_handling, &tharg) != 0){
+	if(pthread_create(&rdma_cqpoll_thread, NULL, rdma_cq_handling, &tharg) != 0){
                 exit(EXIT_FAILURE);
         }
 
-        if(pthread_create(&tx_wait_thread, NULL, tx_wait_ring, &tharg) != 0){
+        if(pthread_create(&rdma_txwait_thread, NULL, client_wait_txring, &tharg) != 0){
                 exit(EXIT_FAILURE);
         }
 
@@ -256,55 +221,5 @@ void *rdma_event_handling(void *arg){
 
         rdma_destroy_event_channel(ec);
 }
-
-void *rdma_cq_handling(void *arg){
-	struct ibv_cq *cq;
-	struct ibv_wc wc;
-	struct rdma_cm_id *id;
-	struct context *ctx;
-	struct thread_args *tharg = (struct thread_args *)arg;
-	int ep_fd = tharg->ep_fd;
-	int i, fd_num;
-	struct epoll_event ev_ret[MAX_EVENTS];
-
-	while(1){
-		if((fd_num = epoll_wait(ep_fd, ev_ret, MAX_EVENTS, -1)) < 0){
-			/* 'interrupted syscall error' occurs when using gdb */
-			continue;
-		}
-
-		for(i = 0; i < fd_num; i++){
-			id = ev_ret[i].data.ptr;
-			ctx = (struct context *)id->context;
-
-			if(ibv_get_cq_event(ctx->comp_channel, &cq, &ctx) != 0){
-				exit(EXIT_FAILURE);
-			}
-
-			ibv_ack_cq_events(cq, 1);
-
-			if(ibv_req_notify_cq(cq, 0) != 0){
-				exit(EXIT_FAILURE);
-			}
-
-			while(ibv_poll_cq(cq, 1, &wc)){
-				if (wc.status == IBV_WC_SUCCESS){
-					if(ctx->rx_flag){
-						rxcon_work_completed(id, &wc);
-					}else{
-						txcon_work_completed(id, &wc);
-					}
-				}else{
-					printf("poll_cq: status is not IBV_WC_SUCCESS\n");
-					exit(EXIT_FAILURE);
-				}
-			}
-		}
-	}
-
-	return NULL;
-}
-
-
 
 

@@ -10,9 +10,9 @@
 #include "rdma.h"
 #include "send.h"
 
-int tx_wait_ring(void *arg){
+int client_wait_txring(void *arg){
 	struct thread_args *tharg = (struct thread_args *)arg;
-	struct rdmanic *pci_dev = tharg->pci_dev;
+	struct nvoib_dev *pci_dev = tharg->pci_dev;
 	struct rdma_event_channel *ec = tharg->ec;
 	struct shared_region *sr = (struct shared_region *)pci_dev->shm_ptr;
 	struct mq_attr attr;
@@ -66,7 +66,7 @@ int tx_wait_ring(void *arg){
 					id = id_test;
 				}else{
 					connected = 1;
-					id_test = tx_start_connect(ec, "192.168.0.2", "12345");
+					id_test = client_start_connect(ec, "192.168.0.2", "12345");
 					id = id_test;
 				}
 				/* here */
@@ -76,7 +76,7 @@ int tx_wait_ring(void *arg){
 				info->skb = skb;
 				info->data_ptr = data_ptr;
 				info->size = size;
-				tx_write_remote(id, data_ptr, size, info);
+				client_write_remote(id, data_ptr, size, info);
 			}
 
 			sr->tx.ring_empty = !sr->tx.buf[next_consume].flag;
@@ -84,7 +84,7 @@ int tx_wait_ring(void *arg){
 	} 
 }
 
-struct rdma_cm_id *tx_start_connect(struct rdma_event_channel *ec, char *dest_host, char *dest_port){
+struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec, char *dest_host, char *dest_port){
         struct addrinfo *addr;
         struct rdma_cm_id *id = NULL;
 
@@ -104,7 +104,7 @@ struct rdma_cm_id *tx_start_connect(struct rdma_event_channel *ec, char *dest_ho
 	return id;
 }
 
-static void tx_set_memory_region(struct rdma_cm_id *id){
+static void client_set_mr(struct rdma_cm_id *id){
 	struct context *ctx = (struct context *)id->context;
 
 	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, ctx->pci_dev.guest_memory, ctx->pci_dev.ram_size,
@@ -121,61 +121,7 @@ static void tx_set_memory_region(struct rdma_cm_id *id){
 	}
 }
 
-static void txcon_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
-	struct context *ctx = (struct context *)id->context;
-	static uint32_t next_prepare = 0;
-
-	if (wc->opcode & IBV_WC_RECV) {
-		int i;
-
-		pthread_mutex_lock(ctx->slot_mutex);
-		if(ctx->msg->id == MSG_MR) {
-			ctx->peer_addr = ctx->msg->addr;
-			ctx->peer_rkey = ctx->msg->rkey;
-			printf("received MR from Server\n");
-
-			for(i = 0; i < ctx->msg->slot_num; i++){
-				ctx->slot[ctx->slot_next_assign + i].data_ptr = ctx->msg->data_ptr[i];
-			}
-
-			ctx->remain_slot += ctx->msg->slot_num;
-			ctx->slot_next_assign = (ctx->slot_next_assign + ctx->msg->slot_num) % RDMA_SLOT;
-			printf("received new %d slot from Server\n", ctx->msg->slot_num);
-		} else if(ctx->msg->id == MSG_ASSIGN) {
-                        for(i = 0; i < ctx->msg->slot_num; i++){
-                                ctx->slot[ctx->slot_next_assign + i].data_ptr = ctx->msg->data_ptr[i];
-                        }
-
-			ctx->remain_slot += ctx->msg->slot_num;
-                        ctx->slot_next_assign = (ctx->slot_next_assign + ctx->msg->slot_num) % RDMA_SLOT;
-			printf("received new %d slot from Server\n", ctx->msg->slot_num);
-		}
-		pthread_mutex_unlock(ctx->slot_mutex);
-
-		rdma_request_msg(id);
-	}else if(wc->opcode & IBV_WC_SEND_RDMA_WITH_IMM){
-		struct shared_region *sr = (struct shared_region *)ctx->pci_dev->shm_ptr;
-		struct write_remote_info *info = (struct write_remote_info *)wc->wr_id;
-
-		/* add used buffer to tx_used ring */
-		if(!sr->tx_used.buf[next_prepare].flag){
-			int index = next_prepare;
-
-			next_prepare = (index + 1) % RING_SIZE;
-			sr->tx_used.buf[index].data_ptr = info->data_ptr;
-			sr->tx_used.buf[index].skb = info->skb;
-			sr->tx_used.buf[index].size = info->size;
-			sr->tx_used.buf[index].flag = 1;
-
-		}else{
-			/* TODO: should wait for guest processing TX_used queue? */
-		}
-
-		free(info);
-	}
-}
-
-static void tx_write_remote(struct rdma_cm_id *id, uint64_t local_offset, uint32_t size,
+static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, uint32_t size,
 	struct write_remote_info *info){
 
 	struct context *ctx = (struct context *)id->context;
