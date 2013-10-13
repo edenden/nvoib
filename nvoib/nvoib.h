@@ -30,7 +30,6 @@ struct nvoib_dev {
 
 	char *shmobj;
 	char *sizearg;
-	char *ramsizearg;
 };
 
 /* registers for the Inter-VM shared memory device */

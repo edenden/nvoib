@@ -11,6 +11,7 @@
 #include "sysemu/kvm.h"
 #include "migration/migration.h"
 #include "qapi/qmp/qerror.h"
+#include "exec/cpu-common.h"
 
 #include "nvoib.h"
 #include "rdma_event.h"
@@ -195,6 +196,15 @@ static int pci_nvoib_thread(struct nvoib_dev *s){
 	return 0;
 }
 
+static void pci_nvoib_set_memory(void *host_addr, ram_addr_t offset, ram_addr_t length, void *opaque){
+	struct nvoib_dev *s = (struct nvoib_dev *)opaque;
+
+	if(offset == 0){
+		s->guest_memory = host_addr;
+		s->ram_size = length;
+	}
+}
+
 static int pci_nvoib_init(PCIDevice *dev){
 	struct nvoib_dev *s = NVOIBDEV(dev);
 	uint8_t *pci_conf;
@@ -204,13 +214,6 @@ static int pci_nvoib_init(PCIDevice *dev){
 		s->nvoib_size = 4 << 20; /* 4 MB default */
 	else {
 		s->nvoib_size = nvoib_get_size(s->sizearg);
-	}
-
-	if(s->ramsizearg == NULL){
-		fprintf(stderr, "Must specify size of guest memory using '-ramsize' option\n");
-		exit(1);
-	}else{
-		s->ram_size = nvoib_get_size(s->ramsizearg);
 	}
 
 	register_savevm(DEVICE(dev), "nvoib_dev", 0, 0, nvoib_save, nvoib_load, dev);
@@ -268,13 +271,13 @@ static int pci_nvoib_init(PCIDevice *dev){
 	nvoib_setup_msi(s);
 	dev->config_write = nvoib_write_config;
 
-	s->guest_memory = cpu_physical_memory_map((hwaddr)0x0, (hwaddr *)&(s->ram_size), 1);
+	qemu_ram_foreach_block(pci_nvoib_set_memory, s);
 	if(s->guest_memory == NULL){
 		fprintf(stderr, "nvoib: could not map guest physical to host virtual\n");
 		exit(-1);
 	}
 
-	printf("guest physical 0x000000 is host virtual %p\n", s->guest_memory);
+	printf("guest physical 0x0 is host virtual %p, size = %llu\n", s->guest_memory, (long long unsigned)s->ram_size);
 
 	s->tx_mq = mq_open("/tx_mq", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, NULL);
 	if(s->tx_mq < 0){
@@ -304,7 +307,6 @@ static Property nvoib_properties[] = {
 	DEFINE_PROP_UINT32("vectors", struct nvoib_dev, vectors, 1),
 	DEFINE_PROP_STRING("shm", struct nvoib_dev, shmobj),
 	DEFINE_PROP_UINT32("use64", struct nvoib_dev, nvoib_64bit, 1),
-	DEFINE_PROP_STRING("ramsize", struct nvoib_dev, ramsizearg),
 	DEFINE_PROP_END_OF_LIST(),
 };
 
