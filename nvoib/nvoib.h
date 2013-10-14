@@ -9,27 +9,30 @@
 struct nvoib_dev {
 	PCIDevice parent_obj;
 
-	MemoryRegion nvoib_mmio;
+	MemoryRegion	nvoib_mmio;
 
 	/* We might need to register the BAR before we actually have the memory.
 	 * So prepare a container MemoryRegion for the BAR immediately and
 	 * add a subregion when we have the memory.
 	 */
-	MemoryRegion bar;
-	MemoryRegion nvoib;
+	MemoryRegion	bar;
+	MemoryRegion	nvoib;
 
-	uint64_t nvoib_size; /* size of shared memory region */
-	uint64_t ram_size;	/* size of guest system ram(for RDMA MR register) */
-	uint32_t nvoib_attr;
-	uint32_t nvoib_64bit;
-	int shm_fd; /* shared memory file descriptor */
-	void *shm_ptr;
-	uint32_t vectors;
-	void *guest_memory;
-	mqd_t tx_mq;
+	EventNotifier	rx_event;
+	int		rx_fd;
+	int 		tx_fd;
 
-	char *shmobj;
-	char *sizearg;
+	uint64_t	nvoib_size; /* size of shared memory region */
+	uint64_t	ram_size;	/* size of guest system ram(for RDMA MR register) */
+	uint32_t	nvoib_attr;
+	uint32_t	nvoib_64bit;
+	int		shm_fd; /* shared memory file descriptor */
+	void		*shm_ptr;
+	uint32_t	vectors;
+	void		*guest_memory;
+
+	char		*shmobj;
+	char		*sizearg;
 };
 
 /* registers for the Inter-VM shared memory device */

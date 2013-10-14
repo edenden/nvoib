@@ -26,7 +26,7 @@ void *slot_wait_assigning(void *arg){
         void *buf = NULL;
         int read_len;
 
-        if(mq_getattr(ctx->sl_mq, &attr) < 0){
+        if(mq_getattr(sl_mq, &attr) < 0){
                 exit(EXIT_FAILURE);
         }
 
@@ -35,11 +35,14 @@ void *slot_wait_assigning(void *arg){
                 exit(EXIT_FAILURE);
         }
 
-	while(read_len = mq_receive(sl_mq, buf, attr.mq_msgsize, NULL)){
-		struct rdma_cm_id *id = *(struct rdma_cm_id *)buf;
-		struct context *ctx = (struct context *)id->context;
-		pthread_mutex_lock(&ctx->msg_mutex);
-		slot_assign_for_peer(id, ctx->slot_assign_num);
+	while(1){
+		read_len = mq_receive(sl_mq, buf, attr.mq_msgsize, NULL);
+		if(read_len > 0){
+			struct rdma_cm_id *id = *(struct rdma_cm_id **)buf;
+			struct context *ctx = (struct context *)id->context;
+			pthread_mutex_lock(&ctx->msg_mutex);
+			slot_assign_for_peer(id, ctx->slot_assign_num);
+		}
 	} 
 
 }
@@ -51,6 +54,7 @@ static void slot_assign_for_peer(struct rdma_cm_id *id, int slot){
 	int i;
 	int allocated_count = 0;
 
+	/* In some cases, busy waiting occurs until skbuffs are allocated... */
 	while(allocated_count < slot){
 		sr->rx_avail.ring_empty = 0;
 		for(i = 0; i < slot && !sr->rx_avail.ring_empty; i++){
@@ -96,7 +100,7 @@ static void slot_send(struct rdma_cm_id *id){
 
 	memset(&wr, 0, sizeof(wr));
 
-	wr.wr_id = NULL;
+	wr.wr_id = 0;
 	wr.opcode = IBV_WR_SEND;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;

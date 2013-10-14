@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
+#include <sys/eventfd.h>
 #include <mqueue.h>
 
 #include "hw/pci/pci.h"
@@ -23,9 +24,6 @@ void *client_wait_txring(void *arg){
 	struct nvoib_dev *pci_dev = tharg->pci_dev;
 	struct rdma_event_channel *ec = tharg->ec;
 	struct shared_region *sr = (struct shared_region *)pci_dev->shm_ptr;
-	struct mq_attr attr;
-	void *buf = NULL;
-	int read_len;
 	static uint32_t next_consume = 0;
 
 	/* temporary for debugging... */
@@ -33,16 +31,13 @@ void *client_wait_txring(void *arg){
 	static struct rdma_cm_id *id_test;
 	/* here */
 
-	if(mq_getattr(pci_dev->tx_mq, &attr) < 0){
-		exit(EXIT_FAILURE);
-	}
+	while(1){
+		uint64_t val;
 
-	buf = malloc(attr.mq_msgsize);
-	if(buf == NULL){
-		exit(EXIT_FAILURE);
-	}
+		if(read(pci_dev->tx_fd, &val, sizeof(uint64_t)) < 0){
+			printf("failed to recv eventfd\n");
+		}
 
-	while(read_len = mq_receive(pci_dev->tx_mq, buf, attr.mq_msgsize, NULL)){
 		/* process tx buffer */
 		sr->tx.ring_empty = 0;
 		while(!sr->tx.ring_empty){
@@ -90,13 +85,16 @@ void *client_wait_txring(void *arg){
 			sr->tx.ring_empty = !sr->tx.buf[next_consume].flag;
 		}
 	} 
+
+	return NULL;
 }
 
-struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec, char *dest_host, char *dest_port){
+struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec,
+					const char *dest_host, const char *dest_port){
         struct addrinfo *addr;
         struct rdma_cm_id *id = NULL;
 
-        if(getaddrinfo(host, port, NULL, &addr) != 0){
+        if(getaddrinfo(dest_host, dest_port, NULL, &addr) != 0){
                 exit(EXIT_FAILURE);
         }
 
@@ -167,14 +165,12 @@ static void client_write_remote(struct rdma_cm_id *id, uint64_t local_offset, ui
 	wr.wr.rdma.remote_addr = ctx->peer_addr + remote_offset;
 	wr.wr.rdma.rkey = ctx->peer_rkey;
 
-	if (len) {
-		wr.sg_list = &sge;
-		wr.num_sge = 1;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
 
-		sge.addr = (uintptr_t)ctx->pci_dev->guest_memory + local_offset;
-		sge.length = size;
-		sge.lkey = ctx->guest_memory_mr->lkey;
-	}
+	sge.addr = (uintptr_t)ctx->pci_dev->guest_memory + local_offset;
+	sge.length = size;
+	sge.lkey = ctx->guest_memory_mr->lkey;
 
 	if(ibv_post_send(id->qp, &wr, &bad_wr) != 0){
 		exit(EXIT_FAILURE);

@@ -1,5 +1,6 @@
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <sys/eventfd.h>
 #include <rdma/rdma_cma.h>
 #include <pthread.h>
 #include <mqueue.h>
@@ -24,8 +25,8 @@ static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
 		case Doorbell:
 			/* check that dest VM ID is reasonable */
 			if ((val & 0xffff) == 0) {
-				if(mq_send(pci_dev->tx_mq, (const char *)&val, sizeof(uint32_t), 10) != 0){
-					printf("failed to send message queue\n");
+				if(write(pci_dev->tx_fd, &val, sizeof(uint64_t)) < 0){
+					printf("failed to send eventfd\n");
 				}
 			}
 			break;
@@ -205,6 +206,12 @@ static void pci_nvoib_set_memory(void *host_addr, ram_addr_t offset, ram_addr_t 
 	}
 }
 
+static void pci_nvoib_rx(void *opaque){
+	struct nvoib_dev *s = (struct nvoib_dev *)opaque;
+	msix_notify(PCI_DEVICE(s), 1);
+	return;
+}
+
 static int pci_nvoib_init(PCIDevice *dev){
 	struct nvoib_dev *s = NVOIBDEV(dev);
 	uint8_t *pci_conf;
@@ -279,12 +286,18 @@ static int pci_nvoib_init(PCIDevice *dev){
 
 	printf("guest physical 0x0 is host virtual %p, size = %llu\n", s->guest_memory, (long long unsigned)s->ram_size);
 
-	s->tx_mq = mq_open("/tx_mq", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, NULL);
-	if(s->tx_mq < 0){
-		fprintf(stderr, "nvoib: could not open message queue\n");
-                exit(-1);
+	s->tx_fd = eventfd(0, 0);
+
+	if(event_notifier_init(&s->rx_event, 0)){
+		fprintf(stderr, "nvoib: could not init event_notifier\n");
+		exit(-1);
 	}
 
+	s->rx_fd = event_notifier_get_fd(&s->rx_event);
+	qemu_set_fd_handler(s->rx_fd, pci_nvoib_rx, NULL, s);
+
+	s->tx_fd = eventfd(0, 0);
+	
 	pci_nvoib_thread(s);
 
 	return 0;
@@ -293,13 +306,15 @@ static int pci_nvoib_init(PCIDevice *dev){
 static void pci_nvoib_uninit(PCIDevice *dev){
 	struct nvoib_dev *s = NVOIBDEV(dev);
 
+	qemu_set_fd_handler(s->rx_fd, NULL, NULL, s);
+	event_notifier_cleanup(&s->rx_event);
+
 	memory_region_destroy(&s->nvoib_mmio);
 	memory_region_del_subregion(&s->bar, &s->nvoib);
 	vmstate_unregister_ram(&s->nvoib, DEVICE(dev));
 	memory_region_destroy(&s->nvoib);
 	memory_region_destroy(&s->bar);
 	unregister_savevm(DEVICE(dev), "nvoib_dev", s);
-	mq_close(s->tx_mq);
 }
 
 static Property nvoib_properties[] = {

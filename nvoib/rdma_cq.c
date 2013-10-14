@@ -92,11 +92,16 @@ static void cq_server_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc, m
 			sr->rx.buf[index].flag		= 1;
 
 			if(sr->rx.ring_empty){
+				uint64_t val = 0;
+
 				/* wake up guest OS */
-				msix_notify(PCI_DEVICE(ctx->pci_dev), 1);
+                                if(write(ctx->pci_dev->rx_fd, &val, sizeof(uint64_t)) < 0){
+                                        printf("failed to send eventfd\n");
+                                }
 			}
 		}else{
-			/* TODO: should wait for guest processing RX queue? */
+			/* Here is not reached because guest driver keeps number of buffer RING_SIZE */
+			exit(EXIT_FAILURE);
 		}
 
 		if(ctx->remain_slot == (RDMA_SLOT / 2)){
@@ -158,7 +163,8 @@ static void cq_client_work_completed(struct rdma_cm_id *id, struct ibv_wc *wc){
 			sr->tx_used.buf[index].flag = 1;
 
 		}else{
-			/* TODO: should wait for guest processing TX_used queue? */
+			/* Here is not reached because guest driver keeps number of buffer RING_SIZE */
+			exit(EXIT_FAILURE);
 		}
 
 		free(info);
