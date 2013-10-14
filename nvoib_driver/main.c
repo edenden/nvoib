@@ -14,6 +14,8 @@
 #define RING_SIZE 256
 
 struct net_device *ip_dev;
+uint32_t tx_balancer = 0;
+uint32_t rx_balancer = 0;
 
 static struct pci_device_id kvm_ivshmem_id_table[] = {
         { 0x1af4, 0x1120, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
@@ -97,11 +99,18 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 		uint64_t ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
 		int index = next_prepare;
 
+		if(tx_balancer == RING_SIZE){
+			ret = -1;
+			goto ring_overflow;
+		}
+
 		next_prepare = (index + 1) % RING_SIZE;
 		sr->tx.buf[index].data_ptr = ptr;
 		sr->tx.buf[index].skb = (void *)skb;
 		sr->tx.buf[index].size = skb->len;
 		sr->tx.buf[index].flag = 1;
+
+		tx_balancer++;
 
 		if(sr->tx.ring_empty){
 			/* wake up host OS */
@@ -109,7 +118,10 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 		}
 	}else{
 		ret = -1;
+		goto ring_overflow;
 	}
+
+ring_overflow:
 
         /* release processed buffer */
 	sr->tx_used.ring_empty = 0;
@@ -127,6 +139,7 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 			sr->tx_used.buf[index].size = 0;
 			sr->tx_used.buf[index].flag = 0;
 
+			tx_balancer--;
 			kfree_skb(skb);
 		}
 
@@ -160,6 +173,7 @@ static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
 			sr->rx.buf[index].flag = 0;
 
 			/* packet injection process */
+			rx_balancer--;
 			kfree_skb(skb);
 			/* here */
 		}
@@ -174,6 +188,10 @@ static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
 		uint64_t data_ptr = 0;
 		int index = next_prepare;
 
+		if(rx_balancer == RING_SIZE){
+			goto ring_overflow;
+		}
+
                 skb = alloc_skb(PAGE_SIZE, GFP_KERNEL);
                 if(skb == NULL){
                         printk(KERN_ERR "failed to get buffer\n");
@@ -187,8 +205,11 @@ static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
                 sr->rx_avail.buf[index].skb = (void *)skb;
 		sr->rx_avail.buf[index].size = PAGE_SIZE;
 		sr->rx_avail.buf[index].flag = 1;
+
+		rx_balancer++;
 	}
 
+ring_overflow:
         return ret;
 }
 
@@ -218,6 +239,8 @@ static int prepare_shared_region(struct kvm_ivshmem_device *ivs_info){
 		sr->rx_avail.buf[i].size = PAGE_SIZE;
 		sr->rx_avail.buf[i].flag = 1;
 	}
+
+	rx_balancer = RING_SIZE;
 
 	return 0;
 }
