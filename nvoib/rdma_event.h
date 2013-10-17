@@ -37,7 +37,6 @@ struct context {
         struct ibv_cq *cq;
         struct ibv_comp_channel *comp_channel;
         struct nvoib_dev *pci_dev;
-	int ep_fd;
 
 	pthread_mutex_t msg_mutex;
         struct message *msg;
