@@ -66,7 +66,9 @@ struct shared_region {
 struct kvm_ivshmem_device ivs_info;
 
 static int kick_host(struct kvm_ivshmem_device *ivs_info);
+static void kvm_ivshmem_txused(struct shared_region *sr);
 static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance);
+static void kvm_ivshmem_rxavail(struct shared_region *sr);
 static int kvm_ivshmem_probe_device (struct pci_dev *pdev, const struct pci_device_id * ent);
 static int request_msix_vectors(struct kvm_ivshmem_device *ivs_info, int nvectors);
 static void free_msix_vectors(struct kvm_ivshmem_device *ivs_info, const int max_vector);
@@ -88,42 +90,10 @@ printk(KERN_INFO "kicking host...\n");
 	return 0;
 }
 
-int kvm_ivshmem_tx(struct sk_buff *skb){
-	struct shared_region *sr = ivs_info.base_addr;
-	static uint32_t next_prepare = 0;
+static void kvm_ivshmem_txused(struct shared_region *sr){
 	static uint32_t next_consume = 0;
-	int ret = 0;
 
-	/* add skb to tx ring buffer */
-	if(!sr->tx.buf[next_prepare].flag){
-		uint64_t ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
-		int index = next_prepare;
-
-		if(tx_balancer == RING_SIZE){
-			ret = -1;
-			goto ring_overflow;
-		}
-
-		next_prepare = (index + 1) % RING_SIZE;
-		sr->tx.buf[index].data_ptr = ptr;
-		sr->tx.buf[index].skb = (void *)skb;
-		sr->tx.buf[index].size = skb->len;
-		sr->tx.buf[index].flag = 1;
-
-		tx_balancer++;
-
-		if(sr->tx.ring_empty){
-			/* wake up host OS */
-			kick_host(&ivs_info);
-		}
-	}else{
-		ret = -1;
-		goto ring_overflow;
-	}
-
-ring_overflow:
-
-        /* release processed buffer */
+	/* release processed buffer */
 	sr->tx_used.ring_empty = 0;
 	while(!sr->tx_used.ring_empty){
 		struct sk_buff *skb = NULL;
@@ -146,13 +116,71 @@ ring_overflow:
 		sr->tx_used.ring_empty = !sr->tx_used.buf[next_consume].flag;
 	}
 
+	return;
+}
+
+int kvm_ivshmem_tx(struct sk_buff *skb){
+	struct shared_region *sr = ivs_info.base_addr;
+	static uint32_t next_prepare = 0;
+	int ret = 0;
+
+	/* add skb to tx ring buffer */
+	if(!sr->tx.buf[next_prepare].flag && tx_balancer < RING_SIZE){
+		uint64_t ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
+		int index = next_prepare;
+
+		next_prepare = (index + 1) % RING_SIZE;
+		sr->tx.buf[index].data_ptr = ptr;
+		sr->tx.buf[index].skb = (void *)skb;
+		sr->tx.buf[index].size = skb->len;
+		sr->tx.buf[index].flag = 1;
+
+		if(sr->tx.ring_empty){
+			/* wake up host OS */
+			kick_host(&ivs_info);
+		}
+
+		tx_balancer++;
+	}else{
+		ret = -1;
+	}
+
+	kvm_ivshmem_txused(sr);
+
 	return ret;
+}
+
+static void kvm_ivshmem_rxavail(struct shared_region *sr){
+	static uint32_t next_prepare = 0;
+
+	/* prepare receive buffer */
+	if(!sr->rx_avail.buf[next_prepare].flag && rx_balancer < RING_SIZE){
+		struct sk_buff *skb = NULL;
+		uint64_t data_ptr = 0;
+		int index = next_prepare;
+
+		skb = alloc_skb(PAGE_SIZE, GFP_KERNEL);
+		if(skb == NULL){
+			printk(KERN_ERR "failed to get buffer\n");
+			return;
+		}
+
+		next_prepare = (index + 1) % RING_SIZE;
+		data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
+		sr->rx_avail.buf[index].data_ptr = data_ptr;
+		sr->rx_avail.buf[index].skb = (void *)skb;
+		sr->rx_avail.buf[index].size = PAGE_SIZE;
+		sr->rx_avail.buf[index].flag = 1;
+
+		rx_balancer++;
+	}
+
+	return;
 }
 
 static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
         struct kvm_ivshmem_device *ivs_info = dev_instance;
 	struct shared_region *sr = ivs_info->base_addr;
-	static uint32_t next_prepare = 0;
 	static uint32_t next_consume = 0;
 	int ret = IRQ_HANDLED;
 
@@ -176,40 +204,13 @@ static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
 			rx_balancer--;
 			kfree_skb(skb);
 			/* here */
+
+			kvm_ivshmem_rxavail(sr);
 		}
 
 		sr->rx.ring_empty = !sr->rx.buf[next_consume].flag;
 	}
 
-
-	/* prepare receive buffer */
-	while(!sr->rx_avail.buf[next_prepare].flag){
-		struct sk_buff *skb = NULL;
-		uint64_t data_ptr = 0;
-		int index = next_prepare;
-
-		if(rx_balancer == RING_SIZE){
-			goto ring_overflow;
-		}
-
-                skb = alloc_skb(PAGE_SIZE, GFP_KERNEL);
-                if(skb == NULL){
-                        printk(KERN_ERR "failed to get buffer\n");
-                        ret = IRQ_NONE;
-			break;
-                }
-
-		next_prepare = (index + 1) % RING_SIZE;
-                data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
-                sr->rx_avail.buf[index].data_ptr = data_ptr;
-                sr->rx_avail.buf[index].skb = (void *)skb;
-		sr->rx_avail.buf[index].size = PAGE_SIZE;
-		sr->rx_avail.buf[index].flag = 1;
-
-		rx_balancer++;
-	}
-
-ring_overflow:
         return ret;
 }
 
