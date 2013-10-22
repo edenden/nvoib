@@ -10,16 +10,8 @@
 #include <sys/epoll.h>
 
 #include "debug.h"
-#include "rdma_event.h"
-#include "rdma_client.h"
-#include "rdma_cq.h"
-
-static struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec,
-	const char *dest_host, const char *dest_port);
-static void client_context_prepare(struct rdma_cm_id *id);
-static void client_send_remote(struct rdma_cm_id *id, uint64_t offset,
-        uint32_t size, struct txbuf_info *info);
-static void client_tun_init(int tun_fd, int ep_fd);
+#include "nvoib.h"
+#include "rdma.h"
 
 void *tx_wait(void *arg){
 	struct nvoib_dev *pci_dev = (struct nvoib_dev *)arg;
@@ -27,10 +19,7 @@ void *tx_wait(void *arg){
 	struct ibv_comp_channel *cc = NULL;
         struct epoll_event ev_ret[MAX_EVENTS];
         int i, fd_num, fd;
-	int ep_fd;
-	int ev_fd;
-	int ec_fd;
-	int cc_fd;
+	int ep_fd, ev_fd, ec_fd, cc_fd = 0;
 
         if((ep_fd = epoll_create(MAX_EVENTS)) < 0){
                 exit(EXIT_FAILURE);
@@ -42,10 +31,10 @@ void *tx_wait(void *arg){
         }
 
         ec_fd = ec->fd;
-	add_fd_to_epoll(ec_fd, ep_fd);
+	nvoib_epoll_add(ec_fd, ep_fd);
 
 	ev_fd = pci_dev->tx_fd;
-	add_fd_to_epoll(ev_fd, ep_fd);
+	nvoib_epoll_add(ev_fd, ep_fd);
 
 	while(1){
                 if((fd_num = epoll_wait(ep_fd, ev_ret, MAX_EVENTS, -1)) < 0){
@@ -57,15 +46,15 @@ void *tx_wait(void *arg){
 			fd = ev_ret[i].data.fd;
 
 			if(fd == ec_fd){
-                                rdma_event(ec, &cc, pci_dev, ep_fd);
+                                event_switch(ec, &cc, pci_dev, ep_fd);
                                 if(cc != NULL){
                                         cc_fd = cc->fd;
-					add_fd_to_epoll(cc_fd, ep_fd);
+					nvoib_epoll_add(cc_fd, ep_fd);
                                 }
 			}else if(fd == cc_fd){
-				cq_pull(cc, pci_dev, cq_client_work_completed);
+				comp_pull(cc, pci_dev, comp_client_work_completed);
 			}else if(fd == ev_fd){
-				tx_ring_to_send_queue(ec, pci_dev, ev_fd);
+				ring_tx(ec, pci_dev, ev_fd);
 			}
 		}
 	} 
@@ -74,7 +63,7 @@ void *tx_wait(void *arg){
 	return NULL;
 }
 
-static struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec,
+struct rdma_cm_id *tx_start_connect(struct rdma_event_channel *ec,
 	const char *dest_host, const char *dest_port){
 
         struct addrinfo *addr;
@@ -84,7 +73,7 @@ static struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec,
                 exit(EXIT_FAILURE);
         }
 
-	if(rdma_alloc_context(id) != 0){
+	if(event_alloc_context(id) != 0){
 		exit(EXIT_FAILURE);
 	}
 
@@ -101,7 +90,7 @@ static struct rdma_cm_id *client_start_connect(struct rdma_event_channel *ec,
 	return id;
 }
 
-void schedule_tx_process(int ev_fd){
+void tx_schedule_process(int ev_fd){
 	uint64_t val = 1;
 
 	if(write(ev_fd, &val, sizeof(uint64_t)) < 0){

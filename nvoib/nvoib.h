@@ -1,3 +1,5 @@
+#include "hw/pci/pci.h"
+
 #define PCI_VENDOR_ID_NVOIB PCI_VENDOR_ID_REDHAT_QUMRANET
 #define PCI_DEVICE_ID_NVOIB 0x1120
 #define NVOIB_REG_BAR_SIZE 0x100

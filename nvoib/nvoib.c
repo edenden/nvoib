@@ -14,8 +14,11 @@
 #include "qapi/qmp/qerror.h"
 #include "exec/cpu-common.h"
 
+#include "debug.h"
 #include "nvoib.h"
-#include "rdma_event.h"
+#include "rdma.h"
+
+static int pci_nvoib_thread(struct nvoib_dev *pci_dev);
 
 static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t reg_val, unsigned size){
 	struct nvoib_dev *pci_dev = opaque;
@@ -197,15 +200,15 @@ static void nvoib_write_config(PCIDevice *pci_dev, uint32_t address, uint32_t va
 	msix_write_config(pci_dev, address, val, len);
 }
 
-static int pci_nvoib_thread(struct nvoib_dev *s){
+static int pci_nvoib_thread(struct nvoib_dev *pci_dev){
 	pthread_t rxwait_thread;
 	pthread_t txwait_thread;
 
-	if(pthread_create(&rxwait_thread, NULL, rx_wait, s) != 0){
+	if(pthread_create(&rxwait_thread, NULL, rx_wait, pci_dev) != 0){
 		return -1;
 	}
 
-        if(pthread_create(&txwait_thread, NULL, tx_wait, s) != 0){
+        if(pthread_create(&txwait_thread, NULL, tx_wait, pci_dev) != 0){
                 return -1;
         }
 

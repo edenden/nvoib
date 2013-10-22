@@ -14,8 +14,8 @@
 #define RING_SIZE 256
 
 struct net_device *ip_dev;
-uint32_t tx_balancer = 0;
-uint32_t rx_balancer = 0;
+uint32_t tx_inflight = 0;
+uint32_t rx_inflight = 0;
 
 static struct pci_device_id kvm_ivshmem_id_table[] = {
         { 0x1af4, 0x1120, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
@@ -25,7 +25,8 @@ MODULE_DEVICE_TABLE (pci, kvm_ivshmem_id_table);
 
 enum {
         /* KVM Inter-VM shared memory device register offsets */
-        Doorbell        = 0x00,    /* Doorbell */
+        Doorbell        = 0x00,		/* Doorbell */
+	Init		= 0x04,		/* Initialize */
 };
 
 struct kvm_ivshmem_device {
@@ -90,6 +91,14 @@ printk(KERN_INFO "kicking host...\n");
 	return 0;
 }
 
+static int init_host(struct kvm_ivshmem_device *ivs_info){
+        void __iomem *plx_intscr = ivs_info->regs + Init;
+
+printk(KERN_INFO "Notifying init completion to host...\n");
+        writel(0, plx_intscr);
+        return 0;
+}
+
 static void kvm_ivshmem_txused(struct shared_region *sr){
 	static uint32_t next_consume = 0;
 
@@ -109,7 +118,7 @@ static void kvm_ivshmem_txused(struct shared_region *sr){
 			sr->tx_used.buf[index].size = 0;
 			sr->tx_used.buf[index].flag = 0;
 
-			tx_balancer--;
+			tx_inflight--;
 			kfree_skb(skb);
 		}
 
@@ -125,7 +134,7 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 	int ret = 0;
 
 	/* add skb to tx ring buffer */
-	if(!sr->tx.buf[next_prepare].flag && tx_balancer < RING_SIZE){
+	if(!sr->tx.buf[next_prepare].flag && tx_inflight < RING_SIZE){
 		uint64_t ptr = (uint64_t)virt_to_phys((volatile void *)skb->head);
 		int index = next_prepare;
 
@@ -140,7 +149,7 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 			kick_host(&ivs_info);
 		}
 
-		tx_balancer++;
+		tx_inflight++;
 	}else{
 		ret = -1;
 	}
@@ -154,7 +163,7 @@ static void kvm_ivshmem_rxavail(struct shared_region *sr){
 	static uint32_t next_prepare = 0;
 
 	/* prepare receive buffer */
-	if(!sr->rx_avail.buf[next_prepare].flag && rx_balancer < RING_SIZE){
+	if(!sr->rx_avail.buf[next_prepare].flag && rx_inflight < RING_SIZE){
 		struct sk_buff *skb = NULL;
 		uint64_t data_ptr = 0;
 		int index = next_prepare;
@@ -172,7 +181,7 @@ static void kvm_ivshmem_rxavail(struct shared_region *sr){
 		sr->rx_avail.buf[index].size = PAGE_SIZE;
 		sr->rx_avail.buf[index].flag = 1;
 
-		rx_balancer++;
+		rx_inflight++;
 	}
 
 	return;
@@ -201,7 +210,7 @@ static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
 			sr->rx.buf[index].flag = 0;
 
 			/* packet injection process */
-			rx_balancer--;
+			rx_inflight--;
 			kfree_skb(skb);
 			/* here */
 
@@ -241,7 +250,7 @@ static int prepare_shared_region(struct kvm_ivshmem_device *ivs_info){
 		sr->rx_avail.buf[i].flag = 1;
 	}
 
-	rx_balancer = RING_SIZE;
+	rx_inflight = RING_SIZE;
 
 	return 0;
 }
@@ -292,6 +301,7 @@ static int kvm_ivshmem_probe_device (struct pci_dev *pdev, const struct pci_devi
 	}
 
 	pci_set_drvdata(pdev, &ivs_info);
+	init_host(&ivs_info);
 	return 0;
 
 reg_release:
