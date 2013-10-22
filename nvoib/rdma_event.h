@@ -1,59 +1,29 @@
-void rdma_request_next_msg(struct rdma_cm_id *id);
-void rdma_request_next_write(struct rdma_cm_id *id);
-void *rdma_event_handling(void *args);
-
 #define TIMEOUT_IN_MS 500
 #define MAX_EVENTS 16
-#define RING_SIZE 256
-#define RDMA_SLOT 8
+#define DEST_HOST "192.168.0.2"
+#define DEST_PORT "12345"
 
-enum message_id {
-	MSG_MR = 0,
-	MSG_ASSIGN,
+struct inflight {
+	void	*skb;
+	uint64_t data_ptr;
 };
 
-struct thread_args {
-	int ep_fd;
-	mqd_t sl_mq;
-	struct nvoib_dev *pci_dev;
-	struct rdma_event_channel *ec;
-};
-
-struct message {
-	uint32_t id;
-	uint64_t addr;
-	uint32_t rkey;
-	uint32_t slot_num;
-	uint64_t data_ptr[RDMA_SLOT];
-};
-
-struct rdma_slot {
-        void            *skb;
-        uint64_t        data_ptr;
+struct temp_buffer {
+	struct inflight info;
+	int	size;
+	struct temp_buffer *next;
 };
 
 struct context {
-        struct ibv_pd *pd;
-        struct ibv_cq *cq;
-        struct ibv_comp_channel *comp_channel;
-        struct nvoib_dev *pci_dev;
+        struct ibv_pd	*pd;
+        struct ibv_cq	*cq;
+        struct ibv_mr	*guest_memory_mr;
 
-	pthread_mutex_t msg_mutex;
-        struct message *msg;
-        struct ibv_mr *msg_mr;
-        struct ibv_mr *guest_memory_mr;
-	int rx_flag;
+	int		initialized;
 
-	pthread_mutex_t slot_mutex;
-	int next_slot;
-	int remain_slot;
-	int next_slot_assign;
-	int slot_assign_num;
-	struct rdma_slot slot[RDMA_SLOT];
-
-        /* Used only on tx side */
-        uint64_t peer_addr;
-        uint32_t peer_rkey;
+	/* temporary for debug */
+	struct temp_buffer temp_start;
+	struct temp_buffer *temp_last_ptr;
 };
 
 struct buf_data {
@@ -75,3 +45,7 @@ struct shared_region {
 	struct ring_buf tx_used;	/* Host chains processed buffer to 'tx_used' */
 };
 
+void rdma_event(struct rdma_event_channel *ec, struct ibv_comp_channel **cc,
+	struct nvoib_dev *pci_dev, int ep_fd);
+void rdma_event_channel_init(struct rdma_event_channel *ec, int ep_fd);
+int rdma_alloc_context(struct rdma_cm_id *id);

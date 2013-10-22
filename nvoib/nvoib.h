@@ -38,6 +38,7 @@ struct nvoib_dev {
 /* registers for the Inter-VM shared memory device */
 enum nvoib_registers {
         /* KVM Inter-VM shared memory device register offsets */
-        Doorbell        = 0x00,    /* Doorbell */
+        Doorbell        = 0x00,		/* Doorbell */
+	Init		= 0x04,		/* Initialize */
 };
 

@@ -17,17 +17,27 @@
 #include "nvoib.h"
 #include "rdma_event.h"
 
-static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned size){
+static void nvoib_io_write(void *opaque, hwaddr addr, uint64_t reg_val, unsigned size){
 	struct nvoib_dev *pci_dev = opaque;
+	uint64_t ev_val = 1;
+
 	addr &= 0xff;
 
 	switch (addr){
 		case Doorbell:
 			/* check that dest VM ID is reasonable */
-			if ((val & 0xffff) == 0) {
-				if(write(pci_dev->tx_fd, &val, sizeof(uint64_t)) < 0){
+			if((reg_val & 0xffff) == 0){
+				if(write(pci_dev->tx_fd, &ev_val, sizeof(uint64_t)) < 0){
 					printf("failed to send eventfd\n");
 				}
+				dprintf("Doorbell occured\n");
+			}
+			break;
+
+		case Init:
+			if((reg_val & 0xffff) == 0){
+				pci_nvoib_thread(pci_dev);
+				dprintf("Init occured\n");
 			}
 			break;
 
@@ -188,11 +198,16 @@ static void nvoib_write_config(PCIDevice *pci_dev, uint32_t address, uint32_t va
 }
 
 static int pci_nvoib_thread(struct nvoib_dev *s){
-	pthread_t rdma_thread;
+	pthread_t rxwait_thread;
+	pthread_t txwait_thread;
 
-	if(pthread_create(&rdma_thread, NULL, rdma_event_handling, s) != 0){
+	if(pthread_create(&rxwait_thread, NULL, rx_wait, s) != 0){
 		return -1;
 	}
+
+        if(pthread_create(&txwait_thread, NULL, tx_wait, s) != 0){
+                return -1;
+        }
 
 	return 0;
 }
@@ -295,10 +310,6 @@ static int pci_nvoib_init(PCIDevice *dev){
 
 	s->rx_fd = event_notifier_get_fd(&s->rx_event);
 	qemu_set_fd_handler(s->rx_fd, pci_nvoib_rx, NULL, s);
-
-	s->tx_fd = eventfd(0, 0);
-	
-	pci_nvoib_thread(s);
 
 	return 0;
 }

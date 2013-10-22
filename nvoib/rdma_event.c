@@ -6,55 +6,47 @@
 #include <rdma/rdma_cma.h>
 #include <sys/epoll.h>
 #include <pthread.h>
-#include <mqueue.h>
 
-#include "hw/pci/pci.h"
-#include "hw/pci/msix.h"
-
-#include "nvoib.h"
+#include "debug.h"
 #include "rdma_event.h"
 #include "rdma_cq.h"
 #include "rdma_server.h"
 #include "rdma_client.h"
-#include "rdma_slot.h"
 
-static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
-						int ep_fd, int flag);
+static void rdma_build_context(struct rdma_cm_id *id, struct ibv_comp_channel *cc);
 static void rdma_build_connection(struct rdma_cm_id *id);
+static struct ibv_comp_channel *rdma_comp_channel_init(struct rdma_cm_id *id, int ep_fd);
 static void rdma_set_conn_params(struct rdma_conn_param *params);
 static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_attr);
-static void rdma_cleanup_context(struct rdma_cm_id *id, int ep_fd);
-static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd, mqd_t sl_mq);
+static void rdma_context_init_completed(struct rdma_cm_id *id);
+static void rdma_cleanup_context(struct rdma_cm_id *id);
 
-static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_dev *pci_dev,
-						int ep_fd, int flag){
-
+int rdma_alloc_context(struct rdma_cm_id *id){
 	struct context *ctx;
-	struct epoll_event ev;
+
 	ctx = (struct context *)malloc(sizeof(struct context));
+	ctx->initialized = 0;
+
+	/* following is temporary for debug */
+	ctx->temp_start.next = NULL;
+	ctx->temp_last_ptr = &(ctx->temp_start);
+	/* here */
+
 	id->context = ctx;
+        return 0;
+}
 
-	ctx->pci_dev = pci_dev;
-	ctx->rx_flag = flag;
-        ctx->next_slot = 0;
-        ctx->remain_slot = 0;
-        ctx->next_slot_assign = 0;
+static void rdma_build_context(struct rdma_cm_id *id, struct ibv_comp_channel *cc){
+	struct context *ctx;
 
-	pthread_mutex_init(&ctx->msg_mutex, NULL);
-	pthread_mutex_init(&ctx->slot_mutex, NULL);
+	ctx = (struct context *)id->context;
 
 	ctx->pd = ibv_alloc_pd(id->verbs);
 	if(ctx->pd == NULL){
 		exit(EXIT_FAILURE);
 	}
 
-	ctx->comp_channel = ibv_create_comp_channel(id->verbs);
-	if(ctx->comp_channel == NULL){
-		exit(EXIT_FAILURE);
-	}
-
-	/* cqe = 10 is arbitrary */
-	ctx->cq = ibv_create_cq(id->verbs, 10, NULL, ctx->comp_channel, 0);
+	ctx->cq = ibv_create_cq(id->verbs, RING_SIZE, id, cc, 0);
 	if(ctx->cq == NULL){
 		exit(EXIT_FAILURE);
 	}
@@ -63,15 +55,7 @@ static struct context *rdma_build_context(struct rdma_cm_id *id, struct nvoib_de
 		exit(EXIT_FAILURE);
 	}
 
-	memset(&ev, 0, sizeof(struct epoll_event));
-	ev.events = EPOLLIN;
-	ev.data.ptr = id;
-
-	if(epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->comp_channel->fd, &ev) != 0){
-		exit(EXIT_FAILURE);
-	}
-
-	return ctx;
+	return;
 }
 
 static void rdma_build_connection(struct rdma_cm_id *id){
@@ -80,6 +64,37 @@ static void rdma_build_connection(struct rdma_cm_id *id){
 
 	rdma_set_qp_attr(ctx, &qp_attr);
 	if(rdma_create_qp(id, ctx->pd, &qp_attr) != 0){
+		exit(EXIT_FAILURE);
+	}
+
+	return;
+}
+
+static void rdma_set_mr(struct rdma_cm_id *id, struct nvoib_dev *pci_dev){
+	struct context *ctx = (struct context *)id->context;
+
+	ctx->guest_memory_mr = ibv_reg_mr(ctx->pd, pci_dev->guest_memory, pci_dev->ram_size,
+		IBV_ACCESS_LOCAL_WRITE);
+	if(ctx->guest_memory_mr == NULL){
+		exit(EXIT_FAILURE);
+	}
+}
+
+static struct ibv_comp_channel *rdma_comp_channel_init(struct rdma_cm_id *id, int ep_fd){
+	struct ibv_comp_channel *cc;
+
+	cc = ibv_create_comp_channel(id->verbs);
+	return cc;
+}
+
+void add_fd_to_epoll(int new_fd, int ep_fd){
+	struct epoll_event ev;
+
+	memset(&ev, 0, sizeof(struct epoll_event));
+	ev.events = EPOLLIN;
+	ev.data.fd = new_fd;
+
+	if(epoll_ctl(ep_fd, EPOLL_CTL_ADD, new_fd, &ev) != 0){
 		exit(EXIT_FAILURE);
 	}
 
@@ -100,80 +115,65 @@ static void rdma_set_qp_attr(struct context *ctx, struct ibv_qp_init_attr *qp_at
 	qp_attr->recv_cq = ctx->cq;
 	qp_attr->qp_type = IBV_QPT_RC;
 
-	qp_attr->cap.max_send_wr = 10;
-	qp_attr->cap.max_recv_wr = 10;
+	qp_attr->cap.max_send_wr = RING_SIZE;
+	qp_attr->cap.max_recv_wr = RING_SIZE;
 	qp_attr->cap.max_send_sge = 1;
 	qp_attr->cap.max_recv_sge = 1;
 }
 
-static void rdma_cleanup_context(struct rdma_cm_id *id, int ep_fd){
+static void rdma_context_init_completed(struct rdma_cm_id *id, struct nvoib_dev *pci_dev){
+        struct context *ctx = (struct context *)id->context;
+
+	ctx->initialized = 1;
+
+	/* following is temporary for debug */
+	struct temp_buffer *temp;
+	struct inflight *info;
+	temp = ctx->temp_start.next;
+
+	while(temp != NULL){
+		info = (struct inflight *)malloc(sizeof(struct inflight));
+		info->skb	= temp->info.skb;
+		info->data_ptr	= temp->info.data_ptr;
+		rdma_request_send(id, pci_dev, temp->info.data_ptr, temp->size, info);
+		temp = temp->next;
+	}
+	/* here */
+
+        return;
+}
+
+static void rdma_cleanup_context(struct rdma_cm_id *id){
         struct context *ctx = (struct context *)id->context;
 
         ibv_dereg_mr(ctx->guest_memory_mr);
-        ibv_dereg_mr(ctx->msg_mr);
-
-	if(epoll_ctl(ep_fd, EPOLL_CTL_DEL, ctx->comp_channel->fd, NULL) != 0){
-		exit(EXIT_FAILURE);
-	}
-
-        free(ctx->msg);
         free(ctx);
+	return;
 }
 
-void rdma_request_next_msg(struct rdma_cm_id *id){
-        struct context *ctx = (struct context *)id->context;
+void rdma_event(struct rdma_event_channel *ec, struct ibv_comp_channel **cc,
+	struct nvoib_dev *pci_dev, int ep_fd){
 
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-        struct ibv_sge sge;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-
-        sge.addr = (uintptr_t)ctx->msg;
-        sge.length = sizeof(*ctx->msg);
-        sge.lkey = ctx->msg_mr->lkey;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
-}
-
-void rdma_request_next_write(struct rdma_cm_id *id){
-        struct ibv_recv_wr wr, *bad_wr = NULL;
-
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = (uintptr_t)id;
-        wr.sg_list = NULL;
-        wr.num_sge = 0;
-
-        if(ibv_post_recv(id->qp, &wr, &bad_wr) != 0){
-                exit(EXIT_FAILURE);
-        }
-}
-
-static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci_dev, int ep_fd, mqd_t sl_mq){
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
-	struct context *ctx = NULL;
 
-	rdma_set_conn_params(&cm_params);
-
-	while(rdma_get_cm_event(ec, &event) == 0){
+	if(rdma_get_cm_event(ec, &event) == 0){
 		struct rdma_cm_event event_copy;
+		struct context *ctx;
 
 		memcpy(&event_copy, event, sizeof(struct rdma_cm_event));
 		rdma_ack_cm_event(event);
 
 		switch(event_copy.event){
 			case RDMA_CM_EVENT_ADDR_RESOLVED:
-				ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 0);
+				dprintf("test: RDMA_CM_EVENT_ADDR_RESOLVED occured\n");
+				if(*cc == NULL){
+					*cc = rdma_comp_channel_init(event_copy.id, ep_fd);
+				}
+
+				rdma_build_context(event_copy.id, *cc);
 				rdma_build_connection(event_copy.id);
-				client_set_mr(event_copy.id);
-				rdma_request_next_msg(event_copy.id);
+				rdma_set_mr(event_copy.id, pci_dev);
 
 				if(rdma_resolve_route(event_copy.id, TIMEOUT_IN_MS) != 0){
 					exit(EXIT_FAILURE);
@@ -181,88 +181,99 @@ static void rdma_event_loop(struct rdma_event_channel *ec, struct nvoib_dev *pci
 				break;
 
 			case RDMA_CM_EVENT_ROUTE_RESOLVED:
+				dprintf("test: RDMA_CM_EVENT_ROUTE_RESOLVED occured\n");
+				rdma_set_conn_params(&cm_params);
 				if(rdma_connect(event_copy.id, &cm_params) != 0){
 					exit(EXIT_FAILURE);
 				}
+
 				break;
 
 			case RDMA_CM_EVENT_CONNECT_REQUEST:
-                                ctx = rdma_build_context(event_copy.id, pci_dev, ep_fd, 1);
-                                rdma_build_connection(event_copy.id);
-				server_set_mr(event_copy.id);
-				rdma_request_next_write(event_copy.id);
+				dprintf("test: RDMA_CM_EVENT_CONNECT_REQUEST occured\n");
+				if(*cc == NULL){
+					*cc = rdma_comp_channel_init(event_copy.id, ep_fd);
+				}
 
+                                rdma_build_context(event_copy.id, *cc);
+                                rdma_build_connection(event_copy.id);
+				rdma_set_mr(event_copy.id, pci_dev);
+				rxavail_ring_to_recv_queue(id, pci_dev);
+
+				rdma_set_conn_params(&cm_params);
 				if(rdma_accept(event_copy.id, &cm_params) != 0){
 					exit(EXIT_FAILURE);
 				}
 				break;
 
 			case RDMA_CM_EVENT_ESTABLISHED:
-				server_conn_estab(event_copy.id, sl_mq);
+				dprintf("test: RDMA_CM_EVENT_ESTABLISHED occured\n");
+				ctx = (struct context *)event_copy.id->context;
+				rdma_context_init_completed(event_copy.id, pci_dev);
 				break;
 
 			case RDMA_CM_EVENT_DISCONNECTED:
+				dprintf("test: RDMA_CM_EVENT_DISCONNECTED occured\n");
 				rdma_destroy_qp(event_copy.id);
-				rdma_cleanup_context(event_copy.id, ep_fd);
+				rdma_cleanup_context(event_copy.id);
 				rdma_destroy_id(event_copy.id);
 				break;
 
 			default:
-				printf("unknown event\n");
+				dprintf("unknown event = %d\n", event_copy.event);
 				exit(EXIT_FAILURE);
 				break;
 		}
 	}
 }
 
-void *rdma_event_handling(void *args){
-	struct nvoib_dev *pci_dev = (struct nvoib_dev *)args;
+void *rx_wait(void *arg){
+	struct nvoib_dev *pci_dev = (struct nvoib_dev *)arg;
         struct rdma_event_channel *ec = NULL;
-	pthread_t rdma_txwait_thread;
-	pthread_t rdma_slotassign_thread;
-	pthread_t rdma_cqpoll_thread;
-	struct thread_args tharg;
+	struct ibv_comp_channel *cc = NULL;
+	int tun_fd;
 	int ep_fd;
-	mqd_t sl_mq;
+	int ec_fd;
+	int cc_fd;
+	struct epoll_event ev_ret[MAX_EVENTS];
+	int i, fd_num, fd;
+
+        if((ep_fd = epoll_create(MAX_EVENTS)) < 0){
+                exit(EXIT_FAILURE);
+        }
 
         ec = rdma_create_event_channel();
         if(ec == NULL){
                 exit(EXIT_FAILURE);
         }
 
-	if((ep_fd = epoll_create(MAX_EVENTS)) < 0){
-		exit(EXIT_FAILURE);
-	}
-
-        sl_mq = mq_open("/sl_mq", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, NULL);
-        if(sl_mq < 0){
-                exit(EXIT_FAILURE);
-        }
+        ec_fd = ec->fd;
+	add_fd_to_epoll(ec_fd, ep_fd);
 
 	server_start_listen(ec, "12345");
 
-	tharg.ep_fd = ep_fd;
-	tharg.sl_mq = sl_mq;
-	tharg.pci_dev = pci_dev;
-	tharg.ec = ec;
+	/* waiting event on RDMA... */
+	while(1){
+		if((fd_num = epoll_wait(ep_fd, ev_ret, MAX_EVENTS, -1)) < 0){
+                        /* 'interrupted syscall error' occurs when using gdb */
+                        continue;
+                }
 
-	if(pthread_create(&rdma_slotassign_thread, NULL, slot_wait_assigning, &tharg) != 0){
-		exit(EXIT_FAILURE);
+		for(i = 0; i < fd_num; i++){
+			fd = ev_ret[i].data.fd;
+
+			if(fd == ec_fd){
+				rdma_event(ec, &cc, pci_dev, ep_fd);
+				if(cc != NULL){
+					cc_fd = cc->fd;
+					add_fd_to_epoll(cc_fd, ep_fd);
+				}
+			}else if(fd == cc_fd){
+				cq_pull(cc, pci_dev, cq_server_work_completed);
+			}
+		}
 	}
 
-	if(pthread_create(&rdma_cqpoll_thread, NULL, cq_wait_poll, &tharg) != 0){
-                exit(EXIT_FAILURE);
-        }
-
-        if(pthread_create(&rdma_txwait_thread, NULL, client_wait_txring, &tharg) != 0){
-                exit(EXIT_FAILURE);
-        }
-
-	/* waiting event on RDMA... */
-	rdma_event_loop(ec, pci_dev, ep_fd, sl_mq);
-
         rdma_destroy_event_channel(ec);
-	return NULL;
+	return 0;
 }
-
-
