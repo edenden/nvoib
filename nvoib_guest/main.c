@@ -50,7 +50,7 @@ struct kvm_ivshmem_device {
 };
 
 struct buf_data {
-	volatile void		*skb;
+	volatile uint64_t	skb;
 	volatile uint64_t	data_ptr;
 	volatile uint32_t	size;
 	volatile uint32_t	flag;
@@ -58,7 +58,7 @@ struct buf_data {
 
 struct ring_buf {
 	struct buf_data buf[RING_SIZE];
-	uint32_t	ring_empty;
+	volatile uint32_t	ring_empty;
 };
 
 struct shared_region {
@@ -120,7 +120,7 @@ static void kvm_ivshmem_txused(struct shared_region *sr){
 
 		if(flag){
 			next_consume = (index + 1) % RING_SIZE;
-			sr->tx_used.buf[index].skb	= NULL;
+			sr->tx_used.buf[index].skb	= 0;
 			sr->tx_used.buf[index].data_ptr	= 0;
 			sr->tx_used.buf[index].size	= 0;
 			__sync_synchronize();
@@ -146,12 +146,12 @@ int kvm_ivshmem_tx(struct sk_buff *skb){
 
 	/* add skb to tx ring buffer */
 	if(!sr->tx.buf[next_prepare].flag && tx_inflight < RING_SIZE){
-		uint64_t ptr = (uint64_t)virt_to_phys((volatile void *)skb->data);
 		int index = next_prepare;
 
 		next_prepare = (index + 1) % RING_SIZE;
-		sr->tx.buf[index].data_ptr	= ptr;
-		sr->tx.buf[index].skb		= (void *)skb;
+		
+		sr->tx.buf[index].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb->data);
+		sr->tx.buf[index].skb		= (uint64_t)skb;
 		sr->tx.buf[index].size		= skb->len;
 		__sync_synchronize();
 		sr->tx.buf[index].flag		= 1;
@@ -179,7 +179,6 @@ static void kvm_ivshmem_rxavail(struct shared_region *sr){
 	/* prepare receive buffer */
 	if(!sr->rx_avail.buf[next_prepare].flag && rx_inflight < RING_SIZE){
 		struct sk_buff *skb = NULL;
-		uint64_t data_ptr = 0;
 		int index = next_prepare;
 
 		skb = dev_alloc_skb(MTU + NET_IP_ALIGN);
@@ -190,9 +189,9 @@ static void kvm_ivshmem_rxavail(struct shared_region *sr){
 
 		next_prepare = (index + 1) % RING_SIZE;
 		skb_reserve(skb, NET_IP_ALIGN);
-		data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->data);
-		sr->rx_avail.buf[index].data_ptr	= data_ptr;
-		sr->rx_avail.buf[index].skb		= (void *)skb;
+
+		sr->rx_avail.buf[index].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb->data);
+		sr->rx_avail.buf[index].skb		= (uint64_t)skb;
 		sr->rx_avail.buf[index].size		= MTU;
 		__sync_synchronize();
 		sr->rx_avail.buf[index].flag		= 1;
@@ -226,7 +225,7 @@ static int count = 0;
 
 		if(flag){
 			next_consume = (index + 1) % RING_SIZE;
-			sr->rx.buf[index].skb		= NULL;
+			sr->rx.buf[index].skb		= 0;
 			sr->rx.buf[index].data_ptr	= 0;
 			sr->rx.buf[index].size		= 0;
 			__sync_synchronize();
@@ -289,7 +288,6 @@ static int prepare_shared_region(struct kvm_ivshmem_device *ivs_info){
 
 	for(i = 0; i < RING_SIZE; i++){
 		struct sk_buff *skb = NULL;
-		uint64_t data_ptr = 0;
 		
 		skb = dev_alloc_skb(MTU + NET_IP_ALIGN);
 		if(unlikely(!skb)){
@@ -298,10 +296,9 @@ static int prepare_shared_region(struct kvm_ivshmem_device *ivs_info){
 		}
 
 		skb_reserve(skb, NET_IP_ALIGN);
-		data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->data);
 
-		sr->rx_avail.buf[i].data_ptr = data_ptr;
-		sr->rx_avail.buf[i].skb = (void *)skb;
+		sr->rx_avail.buf[i].data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->data);
+		sr->rx_avail.buf[i].skb = (uint64_t)skb;
 		sr->rx_avail.buf[i].size = MTU;
 		sr->rx_avail.buf[i].flag = 1;
 	}
