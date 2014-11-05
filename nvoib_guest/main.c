@@ -10,16 +10,13 @@
 #include <linux/skbuff.h>
 #include <linux/if_ether.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <asm/barrier.h>
 
 #include "main.h"
 #include "netdev.h"
 
-#define RING_SIZE 1024
-#define MTU 2048
-
 struct net_device *ip_dev;
-uint32_t tx_inflight = 0;
-uint32_t rx_inflight = 0;
 
 static struct pci_device_id kvm_ivshmem_id_table[] = {
         { 0x1af4, 0x1120, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
@@ -31,49 +28,15 @@ enum {
         /* KVM Inter-VM shared memory device register offsets */
         Doorbell        = 0x00,		/* Doorbell */
 	Init		= 0x04,		/* Initialize */
-};
-
-struct kvm_ivshmem_device {
-        void __iomem * regs;
-        void * base_addr;
-
-        unsigned int regaddr;
-        unsigned int reg_size;
-
-        unsigned int ioaddr;
-        unsigned int ioaddr_size;
-
-        struct pci_dev *dev;
-        char (*msix_names)[256];
-        struct msix_entry *msix_entries;
-        int nvectors;
-};
-
-struct buf_data {
-	volatile uint64_t	skb;
-	volatile uint64_t	data_ptr;
-	volatile uint32_t	size;
-	volatile uint32_t	flag;
-};
-
-struct ring_buf {
-	struct buf_data buf[RING_SIZE];
-	volatile uint32_t	ring_empty;
-};
-
-struct shared_region {
-	struct ring_buf	rx_avail;	/* Guest prepares empty buffer to 'rx_avail' from ZONE_DMA */
-	struct ring_buf	rx;		/* Host writes received data to 'rx' using RDMA */
-	struct ring_buf	tx;		/* Guest chains TX buffer to 'tx' */
-	struct ring_buf tx_used;	/* Host chains processed buffer to 'tx_used' */
+	SregionTop	= 0x08,		/* Top of shared region */
+	SregionBottom	= 0x0c,		/* Bottom of shared region */
+        EthaddrTop      = 0x10,         /* Top-half of ether address */
+        EthaddrBottom   = 0x14,         /* Bottom-half of ether address */
 };
 
 struct kvm_ivshmem_device ivs_info;
 
 static int kick_host(struct kvm_ivshmem_device *ivs_info);
-static void kvm_ivshmem_txused(struct shared_region *sr);
-static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance);
-static void kvm_ivshmem_rxavail(struct shared_region *sr);
 static int kvm_ivshmem_probe_device (struct pci_dev *pdev, const struct pci_device_id * ent);
 static int request_msix_vectors(struct kvm_ivshmem_device *ivs_info, int nvectors);
 static void free_msix_vectors(struct kvm_ivshmem_device *ivs_info, const int max_vector);
@@ -102,210 +65,213 @@ static int init_host(struct kvm_ivshmem_device *ivs_info){
         return 0;
 }
 
-static void kvm_ivshmem_txused(struct shared_region *sr){
-	static uint32_t next_consume = 0;
+static int notify_shared_region(struct kvm_ivshmem_device *ivs_info){
+	void __iomem *plx_intscr;
+	uint64_t offset;
 
-	/* release processed buffer */
-	sr->tx_used.ring_empty = 0;
-	while(!sr->tx_used.ring_empty){
-		struct sk_buff *skb = NULL;
-		uint32_t size = 0;
-		uint32_t flag = 0;
-		int index = next_consume;
+	offset = (uint64_t)virt_to_phys((volatile void *)ivs_info->shared_region);
+	printk(KERN_INFO "Notifying shared region buffer to host(%p)\n", (void *)offset);
 
-		flag	= sr->tx_used.buf[index].flag;
-		__sync_synchronize();
-		skb	= (struct sk_buff *)sr->tx_used.buf[index].skb;
-		size	= sr->tx_used.buf[index].size;
+	plx_intscr = ivs_info->regs + SregionTop;
+	writel(((uint32_t *)&offset)[0], plx_intscr);
 
-		if(flag){
-			next_consume = (index + 1) % RING_SIZE;
-			sr->tx_used.buf[index].skb	= 0;
-			sr->tx_used.buf[index].data_ptr	= 0;
-			sr->tx_used.buf[index].size	= 0;
-			__sync_synchronize();
-			sr->tx_used.buf[index].flag	= 0;
+        plx_intscr = ivs_info->regs + SregionBottom;
+        writel(((uint32_t *)&offset)[1], plx_intscr);
 
-			tx_inflight--;
-			kfree_skb(skb);
+	return 0;
+}
 
-			ip_dev->stats.tx_packets++;
-			ip_dev->stats.tx_bytes += size;
-		}
+void nvoib_eth_addr(unsigned char *dev_addr){
+	void __iomem *plx_intscr;
+	uint32_t val;
 
-		sr->tx_used.ring_empty = !sr->tx_used.buf[next_consume].flag;
-	}
+	plx_intscr = ivs_info.regs + EthaddrTop;
+	val = readl(plx_intscr);
+	memcpy(&(dev_addr[0]), &val, 3);
+
+	plx_intscr = ivs_info.regs + EthaddrBottom;
+	val = readl(plx_intscr);
+	memcpy(&(dev_addr[3]), &val, 3);
 
 	return;
 }
 
-int kvm_ivshmem_tx(struct sk_buff *skb){
-	struct shared_region *sr = ivs_info.base_addr;
-	static uint32_t next_prepare = 0;
-	int ret = 0;
+void nvoib_irq_enable(void){
+	struct shared_region *sr = ivs_info.shared_region;
+	sr->rx.interruptible = 1;
+	return;
+}
+
+void nvoib_irq_disable(void){
+        struct shared_region *sr = ivs_info.shared_region;
+        sr->rx.interruptible = 0;
+        return;
+}
+
+netdev_tx_t nvoib_tx(struct sk_buff *skb, struct net_device *dev){
+	struct shared_region *sr = ivs_info.shared_region;
+	static uint32_t next_index = 0;
+	int flag;
 
 	/* add skb to tx ring buffer */
-	if(!sr->tx.buf[next_prepare].flag && tx_inflight < RING_SIZE){
-		int index = next_prepare;
+	rmb();
+	flag = sr->tx.buf[next_index].flag;
+	if(flag == ENTRY_COMPLETE){
+		struct sk_buff *skb_old;
+		int index;
 
-		next_prepare = (index + 1) % RING_SIZE;
-		
+		index = next_index;
+		next_index = (index + 1) % RING_SIZE;
+
+		rmb();
+		skb_old = (struct sk_buff *)sr->tx.buf[index].skb;
+		if(skb_old != NULL){
+			kfree_skb(skb_old);
+		}
+
+		/* release wmem or rmem */
+		if(skb->destructor != NULL){
+			skb->destructor(skb);
+			skb->destructor = NULL;
+		}
+
 		sr->tx.buf[index].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb->data);
 		sr->tx.buf[index].skb		= (uint64_t)skb;
 		sr->tx.buf[index].size		= skb->len;
-		__sync_synchronize();
-		sr->tx.buf[index].flag		= 1;
+		wmb();
+		sr->tx.buf[index].flag		= ENTRY_AVAILABLE;
+		wmb();
 
-		if(sr->tx.ring_empty){
+		if(sr->tx.interruptible){
 			/* wake up host OS */
 			kick_host(&ivs_info);
+			/* temporary for debugging */
+			ip_dev->stats.tx_errors++;
 		}
 
-		tx_inflight++;
+                ip_dev->stats.tx_packets++;
+                ip_dev->stats.tx_bytes += skb->len;
 	}else{
-		printk(KERN_ERR "NVOIB_FATAL: tx buffer is full or inflight == RING_SIZE\n");
-		//ret = -1;
-		ret = 0;
-	}
-
-	kvm_ivshmem_txused(sr);
-
-	return ret;
-}
-
-static void kvm_ivshmem_rxavail(struct shared_region *sr){
-	static uint32_t next_prepare = 0;
-
-	/* prepare receive buffer */
-	if(!sr->rx_avail.buf[next_prepare].flag && rx_inflight < RING_SIZE){
-		struct sk_buff *skb = NULL;
-		int index = next_prepare;
-
-		skb = dev_alloc_skb(MTU + NET_IP_ALIGN);
-		if(unlikely(!skb)){
-			printk(KERN_ERR "NVOIB_FATAL: failed to get buffer\n");
-			return;
+		if(flag == ENTRY_INFLIGHT){
+			ip_dev->stats.tx_dropped++;
+		}else if(flag == ENTRY_AVAILABLE){
+			ip_dev->stats.tx_errors++;
 		}
-
-		next_prepare = (index + 1) % RING_SIZE;
-		skb_reserve(skb, NET_IP_ALIGN);
-
-		sr->rx_avail.buf[index].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb->data);
-		sr->rx_avail.buf[index].skb		= (uint64_t)skb;
-		sr->rx_avail.buf[index].size		= MTU;
-		__sync_synchronize();
-		sr->rx_avail.buf[index].flag		= 1;
-
-		rx_inflight++;
+		kfree_skb(skb);
 	}
 
-	return;
+	return NETDEV_TX_OK;
 }
 
-static irqreturn_t kvm_ivshmem_rx (int irq, void *dev_instance){
-        struct kvm_ivshmem_device *ivs_info = dev_instance;
-	struct shared_region *sr = ivs_info->base_addr;
-	static uint32_t next_consume = 0;
-	int ret = IRQ_HANDLED;
-uint64_t test;
-static int count = 0;
+int nvoib_rx(struct napi_struct *napi, int badget){
+	struct shared_region *sr = ivs_info.shared_region;
+	static uint32_t next_index = 0;
+	int work_done = 0;
 
 	/* process received buffer */
-	sr->rx.ring_empty = 0;
-	while(!sr->rx.ring_empty){
-		struct sk_buff *skb = NULL;
-		uint32_t size = 0;
-		uint32_t flag = 0;
-		int index = next_consume;
+	rmb();
+	while(sr->rx.buf[next_index].flag == ENTRY_COMPLETE && work_done < badget){
+                struct sk_buff *skb;
+                struct sk_buff *skb_new;
+		uint32_t size;
+		int index;
 
-		flag	= sr->rx.buf[index].flag;
-		__sync_synchronize();
-		skb	= (struct sk_buff *)sr->rx.buf[index].skb;
-		size	= sr->rx.buf[index].size;
+		work_done++;
 
-		if(flag){
-			next_consume = (index + 1) % RING_SIZE;
-			sr->rx.buf[index].skb		= 0;
-			sr->rx.buf[index].data_ptr	= 0;
-			sr->rx.buf[index].size		= 0;
-			__sync_synchronize();
-			sr->rx.buf[index].flag		= 0;
+		/* buffer allocation process */
+                skb_new = dev_alloc_skb(ivs_info.ip_align + ivs_info.mtu);
+                if(unlikely(!skb_new)){
+                        printk(KERN_ERR "NVOIB_FATAL: failed to get buffer\n");
+                        break;
+                }
+                skb_reserve(skb_new, ivs_info.ip_align);
 
-			rx_inflight--;
+		index = next_index;
+		next_index = (index + 1) % RING_SIZE;
 
-			/* packet injection process */
-test = (uint64_t)skb;
-if(test == 0){
-printk(KERN_INFO "skb = %p, count = %d, size = %d\n", (void *)skb, count, size);
-}
-count++;
-			//skb_put(skb, size);
-/*
-			switch(skb->data[0] & 0xf0){
-				case 0x40:
-					skb->protocol = htons(ETH_P_IP);
-					break;
-				case 0x60:
-					skb->protocol = htons(ETH_P_IPV6);
-					break;
-				default:
-					printk(KERN_ERR "NVOIB_FATAL: unknown protocol\n");
-					break;
-			}
-*/
+		rmb();
+		skb		= (struct sk_buff *)sr->rx.buf[index].skb;
+		size		= sr->rx.buf[index].size;
 
-/*
-			skb_reset_mac_header(skb);
-			skb_reset_network_header(skb);
+		/* packet injection process */
+		skb_put(skb, size - IB_UD_GRH);
+		skb->protocol = eth_type_trans(skb, ip_dev);
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+		netif_receive_skb(skb);
 
-			skb->dev = ip_dev;
-			skb->ip_summed = CHECKSUM_UNNECESSARY;
-			netif_rx(skb);
-*/
-dev_kfree_skb(skb);
+		ip_dev->stats.rx_packets++;
+		ip_dev->stats.rx_bytes += size;
 
-			ip_dev->stats.rx_packets++;
-			ip_dev->stats.rx_bytes += size;
+		/* buffer configuration process */
+		sr->rx.buf[index].skb		= (uint64_t)skb_new;
+                sr->rx.buf[index].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb_new->data)
+                                                	- IB_UD_GRH;
+                sr->rx.buf[index].size		= ivs_info.mtu + IB_UD_GRH;
+		wmb();
+                sr->rx.buf[index].flag		= ENTRY_AVAILABLE;
+	}
+	wmb();
 
-			kvm_ivshmem_rxavail(sr);
+	if(work_done < badget){
+		int flag;
+		nvoib_irq_enable();
+		napi_complete(napi);
+		flag = sr->rx.buf[next_index].flag;
+		if(flag  == ENTRY_COMPLETE){
+			nvoib_irq_disable();
+			napi_schedule(napi);
+		}else if(flag == ENTRY_INFLIGHT){
+			ip_dev->stats.rx_dropped++;
+		}else if(flag == ENTRY_AVAILABLE){
+			ip_dev->stats.rx_errors++;
 		}
-
-		sr->rx.ring_empty = !sr->rx.buf[next_consume].flag;
 	}
 
-        return ret;
+        return work_done;
 }
 
-static int prepare_shared_region(struct kvm_ivshmem_device *ivs_info){
-	struct shared_region *sr = ivs_info->base_addr;
+static int prepare_shared_region(struct kvm_ivshmem_device *dev){
+	struct shared_region *sr;
 	int i;
 
-	memset(ivs_info->base_addr, 0, sizeof(struct shared_region));
-	sr->rx.ring_empty	= 1;
-	sr->rx_avail.ring_empty	= 1;
-	sr->tx.ring_empty	= 1;
-	sr->tx_used.ring_empty	= 1;
+	sr = kmalloc(sizeof(struct shared_region), GFP_KERNEL);
+	if(unlikely(!sr)){
+		return -1;
+	}
+	memset(sr, 0, sizeof(struct shared_region));
 
 	for(i = 0; i < RING_SIZE; i++){
-		struct sk_buff *skb = NULL;
+		struct sk_buff *skb;
 		
-		skb = dev_alloc_skb(MTU + NET_IP_ALIGN);
-		if(unlikely(!skb)){
-			printk(KERN_ERR "NVOIB_FATAL: failed to get buffer\n");
-			return -1;
-		}
+                skb = dev_alloc_skb(dev->ip_align + dev->mtu);
+                if(unlikely(!skb)){
+                        printk(KERN_ERR "NVOIB_FATAL: failed to get buffer\n");
+                        return -1;
+                }
 
-		skb_reserve(skb, NET_IP_ALIGN);
+		skb_reserve(skb, dev->ip_align);
 
-		sr->rx_avail.buf[i].data_ptr = (uint64_t)virt_to_phys((volatile void *)skb->data);
-		sr->rx_avail.buf[i].skb = (uint64_t)skb;
-		sr->rx_avail.buf[i].size = MTU;
-		sr->rx_avail.buf[i].flag = 1;
+		sr->rx.buf[i].skb	= (uint64_t)skb;
+		sr->rx.buf[i].data_ptr	= (uint64_t)virt_to_phys((volatile void *)skb->data)
+						- IB_UD_GRH;
+		sr->rx.buf[i].size	= dev->mtu + IB_UD_GRH;
+		sr->rx.buf[i].flag	= ENTRY_AVAILABLE;
+	}
+	wmb();
+
+	dev->shared_region = sr;
+	return 0;
+}
+
+static void nvoib_set_mtu(struct kvm_ivshmem_device *dev){
+	dev->ip_align = NET_IP_ALIGN;
+
+	while((NET_SKB_PAD + dev->ip_align) < IB_UD_GRH){
+		dev->ip_align += L1_CACHE_BYTES;
 	}
 
-	rx_inflight = RING_SIZE;
-
-	return 0;
+	dev->mtu = IB_MTU;
+	return;
 }
 
 static int kvm_ivshmem_probe_device (struct pci_dev *pdev, const struct pci_device_id * ent) {
@@ -326,39 +292,33 @@ static int kvm_ivshmem_probe_device (struct pci_dev *pdev, const struct pci_devi
 		goto pci_disable;
 	}
 
-	ivs_info.ioaddr = pci_resource_start(pdev, 2);
-	ivs_info.ioaddr_size = pci_resource_len(pdev, 2);
-	ivs_info.base_addr = ioremap_cache(ivs_info.ioaddr, ivs_info.ioaddr_size);
-
-	if (!ivs_info.base_addr) {
-		printk(KERN_ERR "IVSHMEM_NIC: Cannot iomap region of size %d\n", ivs_info.ioaddr_size);
-		goto pci_release;
+	if(prepare_shared_region(&ivs_info) < 0){
+		printk(KERN_ERR "failed to get shared region buffer\n");
+		goto pci_disable;
 	}
-
-	prepare_shared_region(&ivs_info);
 
 	ivs_info.regaddr =  pci_resource_start(pdev, 0);
 	ivs_info.reg_size = pci_resource_len(pdev, 0);
 	ivs_info.regs = pci_ioremap_bar(pdev, 0);
 
-	ivs_info.dev = pdev;
-
-	if (!ivs_info.regs) {
+	if(unlikely(!ivs_info.regs)){
 		printk(KERN_ERR "IVSHMEM_NIC: Cannot ioremap registers of size %d\n", ivs_info.reg_size);
-		goto reg_release;
+		goto pci_release;
 	}
 
+	notify_shared_region(&ivs_info);
+
+	ivs_info.dev = pdev;
 	if (request_msix_vectors(&ivs_info, 4) != 0) {
 		printk(KERN_INFO "IVSHMEM_NIC: MSI-X disabled\n");
-		goto reg_release;
+		goto pci_release;
 	}
 
 	pci_set_drvdata(pdev, &ivs_info);
+
 	init_host(&ivs_info);
 	return 0;
 
-reg_release:
-	pci_iounmap(pdev, ivs_info.base_addr);
 pci_release:
 	pci_release_regions(pdev);
 pci_disable:
@@ -404,7 +364,7 @@ static int request_msix_vectors(struct kvm_ivshmem_device *ivs_info, int nvector
 
 	for (i = 0; i < ivs_info->nvectors; i++) {
 		snprintf(ivs_info->msix_names[i], sizeof(*ivs_info->msix_names), "%s-config", name);
-		err = request_irq(ivs_info->msix_entries[i].vector, kvm_ivshmem_rx, 0,
+		err = request_irq(ivs_info->msix_entries[i].vector, nvoib_interrupt, 0,
 			ivs_info->msix_names[i], ivs_info);
 
 		if (err) {
@@ -441,7 +401,6 @@ static void kvm_ivshmem_remove_device(struct pci_dev* pdev){
 	printk(KERN_INFO "IVSHMEM_NIC: Unregister kvm_ivshmem device.\n");
 
         pci_iounmap(pdev, dev_info->regs);
-        pci_iounmap(pdev, dev_info->base_addr);
 	free_msix_vectors(dev_info, dev_info->nvectors);
 	pci_disable_msix(pdev);
         pci_release_regions(pdev);
@@ -455,6 +414,8 @@ static void __exit kvm_ivshmem_cleanup_module (void){
 
 static int __init kvm_ivshmem_init_module (void){
         int err = -ENOMEM;
+
+	nvoib_set_mtu(&ivs_info);
 
         err = pci_register_driver(&kvm_ivshmem_pci_driver);
         if (err < 0) {

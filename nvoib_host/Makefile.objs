@@ -1,4 +1,4 @@
 ifeq ($(CONFIG_PCI), y)
-obj-$(CONFIG_KVM) += nvoib.o rdma_event.o rdma_comp.o rdma_ring.o rdma_tx.o rdma_rx.o
+obj-$(CONFIG_KVM) += nvoib_pci.o nvoib_ss.o nvoib_tx.o nvoib_rx.o nvoib_wc.o nvoib_ring.o nvoib_common.o
 endif
 
